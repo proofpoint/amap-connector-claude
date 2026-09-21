@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""inbox-delivery — the in-sandbox delivery daemon (NOT-FOR-PUBLICATION/delivery_design.md §10).
+
+Watches two inbound trees the runtime writes and performs the LAST HOP into a
+live Claude Code session over its Unix domain socket. No router speaks UDS —
+a socket is reachable only from inside the target's namespace — so this
+process lives in the container and does what no router can.
+
+Two lanes, different treatment, and the difference is the whole design:
+
+  MAIL  (~/.handoff/inbox/)   a notice produces a CONTENT-FREE doorbell —
+                              "you have mail; use the inbox read tool".
+                              Bodies never cross this lane. No outcome file.
+  PEER  (~/.handoff/peer/)    notice + body are injected as a teammate's
+                              request — authorised by the router, evidenced
+                              by the read-only mount (ruling 16) — with an
+                              outcome written back for the router.
+
+Both trees are READ-ONLY mounts. This daemon never creates, moves, renames or
+deletes anything under them; there is no processed/ anywhere. At-most-once
+rests on ONE record — the private delivered ledger under
+AMAP_DELIVERY_STATE_DIR, keyed (tree, notice_id), because notice ids are only
+unique per tree. It is written BEFORE the delivered outcome, survives
+restarts, and is never derived from outcome files.
+
+Contract — eight REQUIRED, no defaults; a missing or unreadable one is a clean
+nonzero exit at start, never a guessed path used silently:
+
+  AMAP_DELIVERY_MAIL_NOTICE_DIR   AMAP_DELIVERY_MAIL_CLAIM
+  AMAP_DELIVERY_PEER_NOTICE_DIR   AMAP_DELIVERY_PEER_MESSAGE_DIR
+  AMAP_DELIVERY_PEER_CLAIM        AMAP_DELIVERY_STATE_DIR
+  AMAP_DELIVERY_OUTCOME_DIR       AMAP_DELIVERY_SESSION_SOURCE
+
+AMAP_DELIVERY_SELF — this agent's own address, optional; see SELF_ENV. Used
+for the doorbell's from-name and the peer lane's to==self integrity check.
+Absent, the doorbell uses a constant and the peer lane refuses, saying why.
+
+THIS DAEMON READS NO POLICY FILE. It once read `self` out of the adapter's
+peers.json, and AMAP_DELIVERY_PEERS was required to name it; both are gone.
+Who may task this agent is the router's decision, and a notice's presence in
+the read-only peer tree is the router's signature on it (ruling 16). Nothing
+here is an allowlist, and there is no longer a file that could be mistaken
+for one.
+
+This daemon knows no sandy variable and derives nothing from one. The wrapper
+that launches it under sandy does that translation (ruling 15); the former
+SANDY_HANDOFF_* cross-check compared values against their own source.
+
+Claims: both are taken first, with the primitive in bin/_inboxlib.py, and
+EITHER being held is a nonzero exit naming the holder. For a daemon there is
+no "continue without the interlock".
+
+Targeting — refuse, don't guess: run AMAP_DELIVERY_SESSION_SOURCE and count the
+rows whose agent is "claude". Exactly one -> inject via its socket and key
+file. Several -> outcome "ambiguous_target", the notice stays in the spool.
+None -> wait and re-poll; sandy no longer starts the relay under --remote, so
+"no panes ever" needs no special case.
+
+The envelope — this daemon OWNS it. Claude Code parses the sender's identity
+and class claim out of the CONTENT STRING with an anchored regex
+(NOT-FOR-PUBLICATION/uds_findings.md §5.1). So a body is never sent as the whole content: every
+injected string is
+
+    <cross-session-message from-name="<addr-spec>">\\n<body>\\n</cross-session-message>
+
+which makes an envelope-shaped body just text, since the regex admits one
+envelope. from-name is the runtime-asserted notice.from on the peer lane.
+from-mode is NEVER set: claiming "bypass" would be asserting a class this
+process does not have, and would turn a missing receiver setting into a
+silent success instead of the `held` outcome that says the sandbox is
+misconfigured.
+
+Wire: NDJSON per NOT-FOR-PUBLICATION/uds_findings.md §2 — an auth frame carrying the peerToken
+from the key file, then ONE user frame with a msg_id and a `from`. RECEIPTS
+ARE OUT OF BAND (NOT-FOR-PUBLICATION/uds_findings.md §8; measured again on 2.1.263, 2026-09-07):
+the receiver CONNECTS OUTWARD to the socket named in `from` and writes
+peer_message_status frames there. Nothing ever comes back on the inbound
+connection — under `refuse` it simply stalls open. So this daemon binds a
+listening reply socket BEFORE it sends, one per in-flight message, in the
+receiver's own socket directory with a basename the receiver accepts
+(REPLY_SOCK_RE), advertises it as `from: "uds:<path>"`, and reads receipts
+there. The per-message socket is the correlation: receipts carry no
+orig_msg_id.
+
+Under `accept` the receiver emits NO receipt on either channel; a successful
+delivery is visible only in the receiver's own log. Therefore SILENCE within
+the receipt window is `delivered` — the frame was accepted and no negative
+receipt arrived — recorded with a `detail` that says exactly that, and it is
+NEVER retried (a retry under `accept` would deliver the task again; that was
+the bug ruling 14 fixed). Negative receipts are the observable ones:
+`expired`+`status_detail: refused` (or `refused`) means the receiving sandbox
+is not accepting cross-session messages — a configuration hold, reported as
+outcome `held` with an operator-facing detail and re-offered on the next
+daemon life; `held` is a human approval pending; `denied` a human said no;
+`dropped` the receiver dropped the frame, retried with backoff.
+
+AMAP_DELIVERY_RECEIPT_WINDOW_SECONDS is the ONE optional variable: how long
+silence must last before it counts as delivered (default 30; refusals arrive
+in about a millisecond and hold receipts within seconds). Tests set it low.
+
+Outcomes: one file per outcome under AMAP_DELIVERY_OUTCOME_DIR named
+<tree>-<notice_id>.json — today always peer-<id>.json, since the mail lane
+writes none. EXACTLY these keys and no others:
+
+    {"outcome": "delivered|held|denied|refused|ambiguous_target|inject_failed",
+     "ts": "<ISO 8601 UTC, seconds, Z>", "tree": "peer",
+     "notice_id": "<32 hex, = the filename's>", "detail": "<optional>"}
+
+Written as .peer-<id>.json.tmp then os.rename — the router reads only names
+matching ^peer-[a-f0-9]{32}\\.json$, so the tmp name MUST keep its leading dot
+and .tmp suffix; never os.link (the router requires nlink == 1); mode 0644.
+THE ROUTER UNLINKS EACH FILE AFTER READING IT: never assume a previous outcome
+is still there, never read outcomes back, and on a later transition for the
+same notice write the same name again. The outcomes directory is created on
+first write — the outbox is rw and the router does not pre-create ext/.
+
+Stdlib only. Everything this process says goes to stderr; stdout is unused.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from typing import Dict, List, Optional, Tuple
+
+NAME = "inbox-delivery"
+CONSUMER_NAME = "inbox-delivery"
+
+ENV_KEYS = (
+    "AMAP_DELIVERY_MAIL_NOTICE_DIR", "AMAP_DELIVERY_MAIL_CLAIM",
+    "AMAP_DELIVERY_PEER_NOTICE_DIR", "AMAP_DELIVERY_PEER_MESSAGE_DIR",
+    "AMAP_DELIVERY_PEER_CLAIM", "AMAP_DELIVERY_STATE_DIR",
+    "AMAP_DELIVERY_OUTCOME_DIR", "AMAP_DELIVERY_SESSION_SOURCE",
+)
+
+TREE_MAIL = "mail"
+TREE_PEER = "peer"
+
+OUTCOMES = ("delivered", "held", "denied", "refused", "ambiguous_target", "inject_failed")
+TERMINAL_RECEIPTS = {"delivered", "denied"}
+
+POLL_SECONDS = 0.5
+HEARTBEAT_SECONDS = 15.0
+RECEIPT_TIMEOUT_SECONDS = 30.0      # default receipt window; see RECEIPT_WINDOW_ENV
+RECEIPT_WINDOW_ENV = "AMAP_DELIVERY_RECEIPT_WINDOW_SECONDS"   # OPTIONAL tuning knob
+
+# This agent's own address, and the ONE variable that is optional without
+# being a tuning knob. It replaced `self` in peers.json, which was the last
+# field this daemon read from that file; that reader is gone and
+# AMAP_DELIVERY_PEERS left the required set with it.
+#
+# ABSENT IS A SUPPORTED DEPLOYMENT, not a misconfiguration to be crashed on.
+# A fleet that declares no fleet domain has no peer lane and no address to
+# name, and the mail lane does not need one — the doorbell falls back to a
+# constant. Requiring this would take the daemon away from every mail-only
+# fleet to protect a lane they do not run. The daemon cannot tell that case
+# apart from a peer fleet that forgot to export it (Config requires the peer
+# directories either way), so it declines to guess and stays useful to both.
+#
+# What makes that safe is that the peer lane's failure WITHOUT this is loud in
+# three places, not silent: a line at startup, an outcome file per refused
+# notice, and the DSN the router raises from it. Fail-closed AND legible is
+# the bar; fail-closed and quiet is the `_admit` defect this file's history
+# is built around.
+#
+# PRESENT-BUT-MALFORMED STILL DIES. A misspelling is not an omission: acting
+# on it would deliver under an address nobody named.
+SELF_ENV = "AMAP_DELIVERY_SELF"
+# The receiver honours a reply address only when its basename has this shape
+# and it sits inside a socket directory the receiver recognises (CROSS_SESSION_INBOUND §6a).
+REPLY_SOCK_RE = re.compile(r"^(\d+(-[0-9a-f]{8})?|[0-9a-f]{1,16})\.sock$")
+HELD_WAIT_SECONDS = 3600.0          # how long a worker waits on a held receipt
+BACKOFF_FIRST, BACKOFF_MAX = 2.0, 300.0
+MAX_BODY_BYTES = 256 * 1024         # a body larger than this is refused, not truncated
+
+NOTICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+NOTICE_FILE_RE = re.compile(r"^notice-([a-f0-9]{32})\.json$")
+# A bare addr-spec, the shape peers.json's `self` and notice.from carry.
+# Deliberately strict: it is compared for equality, never parsed further.
+ADDR_SPEC_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$")
+
+DOORBELL = "you have mail; use the inbox read tool"
+
+
+# --- logging -----------------------------------------------------------------
+
+def log(msg: str) -> None:
+    print(f"{NAME}: {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg: str, code: int = 2) -> "NoReturn":
+    log(f"fatal: {msg}")
+    sys.exit(code)
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# --- the shared module, loaded by path ---------------------------------------
+
+def load_inboxlib():
+    """bin/_inboxlib.py from beside THIS file — no package, no install step,
+    no sys.path from the environment."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(here, "_inboxlib.py")
+    spec = importlib.util.spec_from_file_location("_inboxlib", path)
+    if spec is None or spec.loader is None:
+        die(f"cannot load the shared module at {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --- configuration -----------------------------------------------------------
+
+class Config:
+    """The eight required variables, validated once at start. Attribute names are the
+    variable names minus the prefix, lower-cased."""
+
+    def __init__(self, env: Dict[str, str]):
+        missing = [k for k in ENV_KEYS if not (env.get(k) or "").strip()]
+        if missing:
+            die("missing required environment: " + ", ".join(missing)
+                + " — every AMAP_DELIVERY_* variable is required; there are no "
+                  "defaults, because a guessed path is a wrong path used silently")
+        for k in ENV_KEYS:
+            setattr(self, k[len("AMAP_DELIVERY_"):].lower(), env[k].strip())
+        raw = (env.get(RECEIPT_WINDOW_ENV) or "").strip()
+        self.receipt_window = RECEIPT_TIMEOUT_SECONDS
+        if raw:
+            try:
+                v = float(raw)
+            except ValueError:
+                v = -1.0
+            if not v > 0:
+                die(f"{RECEIPT_WINDOW_ENV} must be a positive number of seconds, got {raw!r}")
+            self.receipt_window = v
+        # Validated HERE, at startup, with the rest of the config — not at
+        # first use. A malformed address would otherwise surface as a peer
+        # lane that refuses everything, which reads as a router fault.
+        raw_self = (env.get(SELF_ENV) or "").strip()
+        self.self_address = raw_self or None
+        if raw_self and not ADDR_SPEC_RE.match(raw_self):
+            die(f"{SELF_ENV}={raw_self!r} is not a bare addr-spec "
+                f"(local@domain). Refusing to start: a misspelling is not an "
+                f"omission, and continuing would run this agent under an "
+                f"address nobody named")
+
+    def check_readable(self) -> None:
+        """Die at start if anything that must already exist does not."""
+        for label, path in (("mail notice dir", self.mail_notice_dir),
+                            ("peer notice dir", self.peer_notice_dir),
+                            ("peer message dir", self.peer_message_dir)):
+            if not os.path.isdir(path):
+                die(f"{label} {path} is not a directory")
+            if not os.access(path, os.R_OK | os.X_OK):
+                die(f"{label} {path} is not readable")
+        if not (os.path.isfile(self.session_source)
+                and os.access(self.session_source, os.X_OK)):
+            die(f"session source {self.session_source} is not an executable file")
+        for label, path in (("state dir", self.state_dir),
+                            ("mail claim", os.path.dirname(self.mail_claim)),
+                            ("peer claim", os.path.dirname(self.peer_claim))):
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as e:
+                die(f"{label} {path} cannot be created: {e}")
+
+
+# --- atomic files ------------------------------------------------------------
+
+def atomic_write_json(path: str, doc: dict, tmp_name: str, mode: int = 0o644) -> None:
+    """Write `doc` to `tmp_name` (a sibling of `path`), fsync, then rename into
+    place. Never os.link — the reader requires nlink == 1."""
+    d = os.path.dirname(path)
+    tmp = os.path.join(d, tmp_name)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(doc, sort_keys=True))
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.rename(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# --- the ledger: the ONLY at-most-once record --------------------------------
+
+class Ledger:
+    """One empty marker per (tree, notice_id) under <state>/ledger/. Existence is
+    the record; the file is created O_EXCL so a crash mid-write cannot leave a
+    half-record that reads as 'delivered'."""
+
+    def __init__(self, state_dir: str):
+        self.dir = os.path.join(state_dir, "ledger")
+        os.makedirs(self.dir, exist_ok=True)
+
+    def _path(self, tree: str, notice_id: str) -> str:
+        return os.path.join(self.dir, f"{tree}-{notice_id}")
+
+    def has(self, tree: str, notice_id: str) -> bool:
+        return os.path.exists(self._path(tree, notice_id))
+
+    def record(self, tree: str, notice_id: str) -> None:
+        try:
+            fd = os.open(self._path(tree, notice_id), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            os.close(fd)
+        except FileExistsError:
+            pass
+
+
+# --- outcomes ------------------------------------------------------------------
+
+class Outcomes:
+    def __init__(self, outcome_dir: str):
+        self.dir = outcome_dir
+
+    def write(self, tree: str, notice_id: str, outcome: str, detail: Optional[str] = None) -> None:
+        assert outcome in OUTCOMES, outcome
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+        except OSError as e:
+            log(f"cannot create outcome dir {self.dir}: {e}")
+            return
+        doc = {"outcome": outcome, "ts": utc_now(), "tree": tree, "notice_id": notice_id}
+        if detail:
+            doc["detail"] = str(detail)[:500]
+        final = os.path.join(self.dir, f"{tree}-{notice_id}.json")
+        # Leading dot + .tmp: a name the router's ^peer-[a-f0-9]{32}\.json$
+        # hygiene excludes, so it never reads a partial file.
+        tmp_name = f".{tree}-{notice_id}.json.tmp"
+        try:
+            atomic_write_json(final, doc, tmp_name)
+        except OSError as e:
+            log(f"cannot write outcome {outcome} for {tree}/{notice_id}: {e}")
+
+
+# --- allowed senders -----------------------------------------------------------
+
+# Must equal the router's ROUTER_LOCAL_PART (`router/config.py` in the local router). Not imported: the daemon
+# has no dependency on the router's code, and the value is a protocol
+# constant, not a configuration.
+ROUTER_LOCAL_PART = "amap.router"
+
+
+# --- notices ---------------------------------------------------------------------
+
+def list_notices(notice_dir: str) -> List[Tuple[str, str]]:
+    """[(notice_id, path)] for every well-named notice file. Never writes."""
+    out = []
+    try:
+        names = os.listdir(notice_dir)
+    except OSError as e:
+        log(f"cannot list {notice_dir}: {e}")
+        return out
+    for name in sorted(names):
+        m = NOTICE_FILE_RE.match(name)
+        if m:
+            out.append((m.group(1), os.path.join(notice_dir, name)))
+    return out
+
+
+def read_json(path: str, limit: int = MAX_BODY_BYTES) -> Optional[dict]:
+    try:
+        if os.path.getsize(path) > limit:
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def sanitize_attr(value: str, limit: int = 200) -> str:
+    """An attribute value inside the envelope tag: printable, no quotes, no
+    newlines, bounded. addr-specs never contain any of those; this is the
+    belt behind that brace."""
+    s = "".join(c for c in str(value) if c.isprintable() and c not in '"\\\r\n')
+    return s[:limit]
+
+
+def envelope(from_name: str, body: str) -> str:
+    """The daemon's OWN envelope around every injected body — see the module
+    docstring. Never from-mode."""
+    return f'<cross-session-message from-name="{sanitize_attr(from_name)}">\n{body}\n</cross-session-message>'
+
+
+# --- targeting -------------------------------------------------------------------
+
+class Target:
+    __slots__ = ("socket_path", "key_file")
+
+    def __init__(self, socket_path: str, key_file: str):
+        self.socket_path = socket_path
+        self.key_file = key_file
+
+
+def find_claude_targets(session_source: str) -> Optional[List[Target]]:
+    """Run the helper; one row per live pane:
+    `agent pane_index pane_pid agent_pid socket keyfile`. Returns the claude
+    rows, or None if the helper itself failed (which is not 'zero panes')."""
+    try:
+        p = subprocess.run([session_source], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"session source failed: {e}")
+        return None
+    if p.returncode != 0:
+        log(f"session source exited {p.returncode}: {p.stderr.strip()[:200]}")
+        return None
+    targets = []
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 6 and parts[0] == "claude":
+            targets.append(Target(parts[4], parts[5]))
+    return targets
+
+
+# --- the wire ----------------------------------------------------------------------
+
+class InjectResult:
+    __slots__ = ("status", "detail")
+
+    def __init__(self, status: str, detail: str = ""):
+        self.status = status      # a receipt status, or "no_receipt", or "error"
+        self.detail = detail
+
+
+def _read_token(key_file: str) -> Optional[str]:
+    doc = read_json(key_file, limit=64 * 1024)
+    tok = doc.get("peerToken") if doc else None
+    return tok if isinstance(tok, str) and tok else None
+
+
+class ReplySocket:
+    """The daemon's OWN listening socket for receipts — bound BEFORE the frame
+    is sent, advertised in the frame's `from`, one per in-flight message (the
+    socket is the correlation; receipts carry no orig_msg_id). It lives in the
+    receiver's socket directory because the receiver only honours a reply
+    address inside a directory it recognises, with a basename matching
+    REPLY_SOCK_RE — otherwise it logs "reply address unshaped" and sends no
+    receipt at all."""
+
+    def __init__(self, socket_dir: str):
+        self.path = os.path.join(socket_dir, uuid.uuid4().hex[:16] + ".sock")
+        assert REPLY_SOCK_RE.match(os.path.basename(self.path))
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        os.chmod(self.path, 0o600)
+        self.srv.listen(8)
+        self.srv.setblocking(False)
+        self.conns: List[socket.socket] = []
+        self.bufs: Dict[int, bytes] = {}
+
+    def receipts(self, deadline: List[float], stop: threading.Event):
+        """Yield every parsed frame that arrives before deadline[0] (a list so
+        the consumer can extend it on `held`) or until `stop`."""
+        import select
+        while not stop.is_set() and time.monotonic() < deadline[0]:
+            wait = min(0.25, max(0.0, deadline[0] - time.monotonic()))
+            try:
+                ready, _, _ = select.select([self.srv] + self.conns, [], [], wait)
+            except (OSError, ValueError):
+                return
+            for r in ready:
+                if r is self.srv:
+                    try:
+                        c, _ = self.srv.accept()
+                    except OSError:
+                        continue
+                    c.setblocking(False)
+                    self.conns.append(c)
+                    self.bufs[c.fileno()] = b""
+                    continue
+                try:
+                    chunk = r.recv(65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    self.conns.remove(r)
+                    self.bufs.pop(r.fileno(), None)
+                    try:
+                        r.close()
+                    except OSError:
+                        pass
+                    continue
+                buf = self.bufs.get(r.fileno(), b"") + chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    try:
+                        frame = json.loads(line.decode("utf-8"))
+                    except ValueError:
+                        continue
+                    if isinstance(frame, dict):
+                        yield frame
+                self.bufs[r.fileno()] = buf
+
+    def close(self) -> None:
+        for c in self.conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+        try:
+            self.srv.close()
+        except OSError:
+            pass
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+def _held_detail(reason: str) -> str:
+    """What a `held` outcome tells the operator. NOT "a human will approve":
+    measured 2026-09-10, a hold caused by a crossSessionInbound SETTING returns
+    the same generic reason as a permission-mode hold ("held for the recipient
+    user's approval"), and the wire carries no cause. Only two of the receiver's
+    eight causes (mode-mismatch, no-mode-asserted) present an approval dialog;
+    the six setting/policy causes park the message until a setting changes and
+    no approval can release them. So quote the receiver and say plainly that the
+    cause is not knowable from here."""
+    said = f' It says: "{reason[:160]}".' if reason else ""
+    return ("held by the receiving sandbox." + said +
+            " The wire carries no hold cause: a permission-mode hold is"
+            " human-approvable, a crossSessionInbound setting hold is not."
+            " Check that sandbox.")
+
+
+def inject(target: Target, content: str, msg_id: str,
+           on_status, stop: threading.Event,
+           first_timeout: float = RECEIPT_TIMEOUT_SECONDS,
+           held_wait: float = HELD_WAIT_SECONDS) -> InjectResult:
+    """Bind the reply socket, send auth + one user frame naming it in `from`,
+    then read receipts FROM THE REPLY SOCKET (never from the inbound
+    connection, which stays silent — module docstring).
+
+    Returns one of: "silent" (no receipt within first_timeout — under `accept`
+    this IS delivery), "delivered", "denied", "held" (waited out),
+    "receiver_refused" (the receiving sandbox does not accept cross-session
+    messages), "dropped", "expired", or "error" (could not bind, connect or
+    send). `on_status(status, reason)` fires for every receipt so a `held` can be
+    written as an outcome while this call keeps waiting for the transition —
+    a receipt listener has to be long-lived (uds_findings §8)."""
+    token = _read_token(target.key_file)
+    if token is None:
+        return InjectResult("error", f"key file {target.key_file} unreadable or has no peerToken")
+    reply = None
+    inbound = None
+    try:
+        try:
+            reply = ReplySocket(os.path.dirname(target.socket_path))
+        except OSError as e:
+            return InjectResult("error", f"cannot bind reply socket: {e}")
+        try:
+            inbound = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            inbound.settimeout(min(first_timeout, 10.0))
+            inbound.connect(target.socket_path)
+            inbound.sendall((json.dumps({"type": "auth", "token": token}) + "\n").encode("utf-8"))
+            inbound.sendall((json.dumps({
+                "type": "user", "from": f"uds:{reply.path}", "msg_id": msg_id,
+                "message": {"role": "user", "content": content},
+            }) + "\n").encode("utf-8"))
+        except OSError as e:
+            return InjectResult("error", f"connect/send failed: {e}")
+
+        deadline = [time.monotonic() + first_timeout]
+        last = "silent"
+        for frame in reply.receipts(deadline, stop):
+            if frame.get("type") != "control" or frame.get("action") != "peer_message_status":
+                continue
+            status = str(frame.get("status") or "")
+            detail = str(frame.get("status_detail") or "")
+            reason = str(frame.get("reason") or frame.get("drop_reason") or "")
+            if status == "refused" or (status == "expired" and detail == "refused"):
+                on_status("receiver_refused", reason)
+                return InjectResult("receiver_refused", reason)
+            last = status or last
+            on_status(status, reason)
+            if status in TERMINAL_RECEIPTS:
+                return InjectResult(status, reason)
+            if status == "held":
+                deadline[0] = time.monotonic() + held_wait     # not terminal: keep listening
+            elif status in ("dropped", "expired"):
+                return InjectResult(status, reason)
+        return InjectResult(last)
+    finally:
+        if reply is not None:
+            reply.close()
+        if inbound is not None:
+            try:
+                inbound.close()
+            except OSError:
+                pass
+
+
+# --- the daemon ------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self, cfg: Config, lib):
+        self.cfg = cfg
+        self.lib = lib
+        self.stop = threading.Event()
+        self.ledger = Ledger(cfg.state_dir)
+        self.outcomes = Outcomes(cfg.outcome_dir)
+        self.window = cfg.receipt_window
+        self.claims: Dict[str, object] = {}
+        self.started_at = utc_now()
+        # per (tree, id): in-flight worker, last outcome written, next retry time
+        self.in_flight: set = set()
+        self.last_outcome: Dict[Tuple[str, str], str] = {}
+        self.retry_at: Dict[Tuple[str, str], float] = {}
+        self.backoff: Dict[Tuple[str, str], float] = {}
+        self.lock = threading.Lock()
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def take_claims(self) -> None:
+        for tree, claim_path, notice_dir in (
+                (TREE_MAIL, self.cfg.mail_claim, self.cfg.mail_notice_dir),
+                (TREE_PEER, self.cfg.peer_claim, self.cfg.peer_notice_dir)):
+            try:
+                self.claims[tree] = self.lib.acquire_consumer_claim(
+                    claim_path, notice_dir, CONSUMER_NAME, log=log)
+            except self.lib.ClaimError as e:
+                # Release whatever we already hold, then refuse. For a daemon
+                # there is no continuing without the interlock.
+                for h in self.claims.values():
+                    h.release()
+                die(f"{tree} claim: {e}")
+
+    def release_claims(self) -> None:
+        for h in self.claims.values():
+            h.release()
+        self.claims.clear()
+
+    def heartbeat(self) -> None:
+        doc = {
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "claims": {TREE_MAIL: self.cfg.mail_claim, TREE_PEER: self.cfg.peer_claim},
+            "heartbeat_at": utc_now(),
+        }
+        try:
+            atomic_write_json(os.path.join(self.cfg.state_dir, "daemon.json"), doc, ".daemon.json.tmp")
+        except OSError as e:
+            log(f"heartbeat write failed: {e}")
+
+    def heartbeat_loop(self) -> None:
+        while not self.stop.is_set():
+            self.heartbeat()
+            self.stop.wait(HEARTBEAT_SECONDS)
+
+    # -- targeting ------------------------------------------------------------
+
+    def one_target(self, tree: str, notice_id: str) -> Optional[Target]:
+        """Exactly one claude row, or None (with the reason handled here)."""
+        targets = find_claude_targets(self.cfg.session_source)
+        if targets is None:
+            return None                       # helper failed: try again later
+        if len(targets) == 0:
+            return None                       # no session yet: wait
+        if len(targets) > 1:
+            if tree == TREE_PEER:
+                self._outcome_once(tree, notice_id, "ambiguous_target",
+                                   f"{len(targets)} live claude sessions; refusing to guess")
+            return None
+        return targets[0]
+
+    def _outcome_once(self, tree: str, notice_id: str, outcome: str, detail: str = "") -> None:
+        """Write an outcome when it is a TRANSITION for this notice. The router
+        dedups per (tree, id, outcome) and unlinks, so rewriting the same state
+        every poll would only churn; a later different state is always written."""
+        key = (tree, notice_id)
+        with self.lock:
+            if self.last_outcome.get(key) == outcome:
+                return
+            self.last_outcome[key] = outcome
+        self.outcomes.write(tree, notice_id, outcome, detail or None)
+
+    # -- mail lane ------------------------------------------------------------
+
+    def mail_pass(self) -> None:
+        for notice_id, _path in list_notices(self.cfg.mail_notice_dir):
+            key = (TREE_MAIL, notice_id)
+            if self.ledger.has(TREE_MAIL, notice_id) or key in self.in_flight:
+                continue
+            if not self._retry_due(key):
+                continue
+            target = self.one_target(TREE_MAIL, notice_id)
+            if target is None:
+                continue
+            me = self.cfg.self_address or "inbox"
+            # Content-free by design: no field of the notice enters the string.
+            content = envelope(me, DOORBELL)
+            self._spawn(key, target, content, is_mail=True)
+
+    # -- peer lane ------------------------------------------------------------
+
+    def peer_pass(self) -> None:
+        for notice_id, path in list_notices(self.cfg.peer_notice_dir):
+            key = (TREE_PEER, notice_id)
+            if self.ledger.has(TREE_PEER, notice_id) or key in self.in_flight:
+                continue
+            if not self._retry_due(key):
+                continue
+            verdict = self._admit(notice_id, path)
+            if verdict is None:
+                continue
+            sender, body = verdict
+            target = self.one_target(TREE_PEER, notice_id)
+            if target is None:
+                continue
+            self._spawn(key, target, envelope(sender, body), is_mail=False)
+
+    def _admit(self, notice_id: str, path: str) -> Optional[Tuple[str, str]]:
+        """The admission gate. Returns (from, body) to inject, or None
+        after writing `refused`. Every failure is fail-closed."""
+        notice = read_json(path)
+        if notice is None:
+            return self._refuse(notice_id, "notice unreadable or not an object")
+        if notice.get("notice_id") != notice_id:
+            return self._refuse(notice_id, "notice_id does not match the filename")
+        if notice.get("kind") != TREE_PEER:
+            return self._refuse(notice_id, f"kind is {notice.get('kind')!r}, not 'peer'")
+        msg = notice.get("message")
+        if not isinstance(msg, dict):
+            return self._refuse(notice_id, "message is not an object")
+        frm = msg.get("from")
+        if not (isinstance(frm, str) and ADDR_SPEC_RE.match(frm)):
+            return self._refuse(notice_id, "message.from is not an addr-spec")
+        # No allowlist (ruling 16). This notice is in a tree only the host can
+        # write, so the router put it here, and the router is the authority on
+        # who may task whom. Two INTEGRITY checks remain, neither of which is
+        # a second opinion on that policy:
+        me = self.cfg.self_address
+        if me is None:
+            # Names the variable, because this detail is the whole diagnostic:
+            # the router forwards no detail into its DSN, so the sender learns
+            # only that it was refused. An operator reading the outcome file
+            # should not have to guess which of the two lanes is unconfigured.
+            return self._refuse(
+                notice_id,
+                f"${SELF_ENV} is not set, so this agent does not know its own "
+                f"address and cannot check that the notice is addressed to it")
+        if frm.split("@", 1)[0] == ROUTER_LOCAL_PART:
+            # The router does not task agents; its own notices arrive on the
+            # MAIL lane as delivery status. A peer notice claiming to be from
+            # it is a fault, and treating it as a task would inject the
+            # router's status text as a teammate's request.
+            return self._refuse(notice_id, f"sender {frm} is the router, which never tasks")
+        body_doc = read_json(os.path.join(self.cfg.peer_message_dir, f"notice-{notice_id}.json"))
+        if body_doc is None:
+            return self._refuse(notice_id, "body spool missing, unreadable or oversized")
+        # THE RECIPIENT CHECK READS THE BODY, NOT THE NOTICE.
+        #
+        # It used to read `message.to` off the notice, which the router never
+        # writes: `deliver.py:_message_and_notice` builds that object with
+        # id/from/subject/preview/mailbox and nothing else. `msg.get("to")` was
+        # therefore always None, `None != me` always true, and EVERY peer
+        # notice was refused — fail-closed, silently, for the whole life of the
+        # lane. The sender got a DSN whose generic prose blamed an allowlist
+        # that ruling 16 had already deleted, so the symptom pointed away from
+        # the cause.
+        #
+        # Validation would not have caught it: since AMP 3.0.0 every
+        # runtime-authored document is OPEN (§7 tolerance; `additionalProperties`
+        # absent, `fixtures/valid/notice-unknown-member.json`), so a runtime
+        # emitting `message.to` passes the gate clean and a reader of it sees
+        # None against this one. Knowing WHICH DOCUMENT carries a field is not
+        # something the schema will enforce for you.
+        #
+        # `to` lives on the message SPOOL doc, which is read just above. The
+        # check itself is right and stays: a notice that landed in this tree
+        # but is addressed elsewhere is a router fault, and injecting another
+        # agent's task is wrong whoever authorised it.
+        to = body_doc.get("to")
+        if to != me:
+            # NAMES THE DOCUMENT IT READ, and the value it found. The previous
+            # wording — "message.to is not self (<me>)" — was identical to what
+            # the BROKEN version emitted while reading the notice, so the one
+            # artefact that survives a refusal could not distinguish "this
+            # daemon is the old build" from "the body really is addressed
+            # elsewhere". An operator holding that string learned nothing about
+            # which, and the DSN forwards no detail at all, so this text is the
+            # whole diagnostic.
+            return self._refuse(
+                notice_id,
+                f"body spool `to` is {to!r}, not self ({me})")
+        body = body_doc.get("body_text")
+        if not isinstance(body, str):
+            return self._refuse(notice_id, "body_text missing")
+        atts = body_doc.get("attachments")
+        if isinstance(atts, list) and atts:
+            lines = []
+            for a in atts[:50]:
+                if isinstance(a, dict):
+                    lines.append("- " + " ".join(
+                        f"{k}={sanitize_attr(str(a.get(k, '')), 120)!r}"
+                        for k in ("filename", "media_type", "size_bytes", "disposition")))
+            body += "\n\nattachments (descriptors only; bytes via read_attachment):\n" + "\n".join(lines)
+        return frm, body
+
+    def _refuse(self, notice_id: str, why: str) -> None:
+        log(f"peer notice {notice_id}: refused — {why}")
+        # Refused is terminal for this notice: record it so it is not re-judged
+        # every poll, then tell the sender through the outcome path.
+        self.ledger.record(TREE_PEER, notice_id)
+        self._outcome_once(TREE_PEER, notice_id, "refused", why)
+        return None
+
+    # -- injection workers ----------------------------------------------------
+
+    def _retry_due(self, key) -> bool:
+        return time.monotonic() >= self.retry_at.get(key, 0.0)
+
+    def _schedule_retry(self, key) -> None:
+        b = self.backoff.get(key, BACKOFF_FIRST)
+        self.retry_at[key] = time.monotonic() + b
+        self.backoff[key] = min(b * 2, BACKOFF_MAX)
+
+    def _spawn(self, key, target: Target, content: str, *, is_mail: bool) -> None:
+        self.in_flight.add(key)
+        t = threading.Thread(target=self._deliver, args=(key, target, content, is_mail), daemon=True)
+        t.start()
+
+    def _deliver(self, key, target: Target, content: str, is_mail: bool) -> None:
+        tree, notice_id = key
+        msg_id = uuid.uuid4().hex
+        try:
+            if is_mail:
+                # A doorbell is non-consuming and a duplicate is a non-event, so
+                # a short receipt wait is enough; ledger on any accepted send.
+                r = inject(target, content, msg_id, lambda s, r_: None, self.stop,
+                           first_timeout=min(5.0, self.window), held_wait=min(5.0, self.window))
+                if r.status == "error":
+                    self._schedule_retry(key)
+                    log(f"mail doorbell {notice_id}: inject failed ({r.detail}); will retry")
+                    return
+                if r.status == "receiver_refused":
+                    # The sandbox refuses cross-session messages; ring again much later.
+                    self.retry_at[key] = time.monotonic() + HELD_WAIT_SECONDS
+                    log(f"mail doorbell {notice_id}: receiver refuses cross-session messages; "
+                        f"will re-offer in {int(HELD_WAIT_SECONDS)}s")
+                    return
+                self.ledger.record(TREE_MAIL, notice_id)
+                return
+
+            def on_status(status: str, reason: str = "") -> None:
+                if status == "held":
+                    self._outcome_once(tree, notice_id, "held", _held_detail(reason))
+
+            r = inject(target, content, msg_id, on_status, self.stop, first_timeout=self.window)
+            if r.status == "silent":
+                # accept emits no receipt on any channel (measured): the frame was
+                # taken and nothing negative came back within the window. This IS
+                # delivery, said honestly in the detail — and it is NEVER retried.
+                self.ledger.record(tree, notice_id)          # BEFORE the outcome
+                self._outcome_once(tree, notice_id, "delivered",
+                                   f"inferred: receiver accepted the frame and issued no negative "
+                                   f"receipt within {self.window:g}s (accept emits none)")
+            elif r.status == "delivered":
+                self.ledger.record(tree, notice_id)          # BEFORE the outcome
+                self._outcome_once(tree, notice_id, "delivered", "receipt: delivered")
+            elif r.status == "denied":
+                self.ledger.record(tree, notice_id)          # a human said no; final
+                self._outcome_once(tree, notice_id, "denied", r.detail)
+            elif r.status == "receiver_refused":
+                # A configuration hold, not a human decision and not this daemon's
+                # gate: the receiving sandbox has crossSessionInbound off or set to
+                # refuse. Alert the operator through `held`; re-offer much later.
+                self._outcome_once(tree, notice_id, "held",
+                                   "receiver refuses cross-session messages — crossSessionInbound is "
+                                   "not `accept` in this sandbox; fix the setting and the daemon re-offers")
+                self.retry_at[key] = time.monotonic() + HELD_WAIT_SECONDS
+            elif r.status == "held":
+                # Waited out; still held. Leave it: re-sending would park a
+                # second copy. The next process life re-offers it.
+                self.retry_at[key] = time.monotonic() + HELD_WAIT_SECONDS
+            else:
+                # error / dropped / expired: nothing was delivered; retry with backoff.
+                self._outcome_once(tree, notice_id, "inject_failed", f"{r.status}: {r.detail}"[:200])
+                self._schedule_retry(key)
+        finally:
+            self.in_flight.discard(key)
+
+    # -- main -----------------------------------------------------------------
+
+    def run(self) -> int:
+        self.take_claims()
+        self.heartbeat()
+        hb = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        hb.start()
+
+        def on_term(signum, frame):
+            self.stop.set()
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGINT, on_term)
+
+        log(f"started pid {os.getpid()}; mail={self.cfg.mail_notice_dir} peer={self.cfg.peer_notice_dir}")
+        try:
+            while not self.stop.is_set():
+                try:
+                    self.mail_pass()
+                    self.peer_pass()
+                except Exception as e:  # never let one bad poll kill the daemon
+                    log(f"poll error: {e}")
+                self.stop.wait(POLL_SECONDS)
+        finally:
+            self.release_claims()
+            self.heartbeat()
+            log("stopped")
+        return 0
+
+
+def main() -> int:
+    env = dict(os.environ)
+    cfg = Config(env)
+    cfg.check_readable()
+    lib = load_inboxlib()
+    return Daemon(cfg, lib).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

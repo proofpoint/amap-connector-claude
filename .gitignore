@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+.DS_Store
+
+# Per-machine / per-sandbox local config — never part of the package, and
+# kept out by LOCATION so `git add -A` (or a fresh snapshot's add) cannot
+# sweep them in regardless of today's contents.
+.claude/settings.local.json
+.sandy/

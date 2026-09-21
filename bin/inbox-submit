@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+"""inbox-submit — thin outbound submit CLI (the §6 drop-box mechanic only).
+
+Standalone extraction (ccc-v0.1) of inbox-lab's `mail-cli submit` /
+`submit-result` subcommands into a self-contained, credential-free connector
+tool. Writes an inert `submit_draft` request file to a drop-box a host-side
+relay polls, applies policy against, and (on approval) actually sends — NO
+network call here, NO JMAP client, NO send/draft code path. The ~40 lines of
+request-building / atomic-write / monotonic-id logic below ORIGINATED in the
+workbench's JMAP core (then inbox-lab, now amap-lab: lib/inboxlab_core.py)
+and were duplicated rather than imported, because a standalone connector
+cannot depend on the workbench it was extracted from. THEY ARE NOW THE ONLY
+COPY: that file, `mail-cli` and `bin/inbox-mcp` were deleted when the lab
+moved off Fastmail JMAP (amap-lab CLAUDE.md, 2026-09-17), so there is no
+longer a second copy to stay in step with. The no-import rule stands on its
+own merits and is unaffected.
+
+Config: the drop-box dir is resolved as `$OUTBOX_DIR` if set, else
+`$MAILBOX_ROOT_DIR/dropbox`, else this process FAILS LOUD (one-line stderr message
+naming the missing var, nonzero exit). No `__file__`-relative default, no
+cwd fallback.
+
+Dual front-end (ccc-v0.2): the CLI below is UNCHANGED; `mcp` is a new,
+separate mode that exposes the same mechanic as two MCP tools (`submit`,
+`submit_result`) over stdio JSON-RPC, for a shell-less agent runtime. See
+the "MCP mode" section further down for the protocol shell (mirrors
+inbox-mcp-vol: initialize/tools-list/tools-call/ping, isError content,
+stdout protocol-pure, traversal-proof req_id).
+
+Attachments (attachments-outbound-v0.1): `submit` accepts `--attach PATH`
+(CLI, repeatable) / an `attachments: [{path, filename?, media_type?}]`
+argument (MCP). Each input file is streamed into a per-request sidecar
+directory alongside the request JSON, hashed (sha256) and sized as written,
+and the request gains a `draft.attachments[]` descriptor array — the
+request JSON is written LAST (commit sentinel: every sidecar exists before
+the request is considered published). Carriage only: attachment handling is
+the relay's, not this connector's. On the peer lane, attachment-bearing
+requests measured as `accepted` with no human step — 9 independent
+observations, 2026-09-21. MAIL-LANE BEHAVIOUR UNTESTED. No DLP/AV screener
+exists in this path; do not describe one. See README.md and
+agent-mailbox-protocol/spec/attachments-v0.1.md.
+
+Commands:
+  submit --to A[,B..] [--cc ..] [--subject ..] [--body .. | stdin]
+         [--reply-to-id ID] [--attach PATH ...]
+      Writes req-<id>.json (atomic .tmp + os.replace) to the drop-box; id is
+      monotonic across pending + processed + results (see _next_req_id).
+      Each --attach is streamed to a sidecar before the request JSON is
+      written (see "Attachments" above) — the request always ends up
+      queued for human approval when attachments are present.
+  submit-result <req_id>
+      Prints results/<req_id>.json if the relay has answered, else "pending".
+      The result JSON may carry optional AMP v2.1.0 fields: `reason_code`
+      (machine-readable, names which policy path authorized/refused —
+      human text stays in `detail`), `ts`, and `attestation` (the runtime's
+      identity stamp on an accepted send, self-stamp or verifiable —
+      surfaced only, never verified here).
+  mcp
+      Runs as a stdio MCP server exposing `submit` + `submit_result` tools
+      (no read tool, no send capability, no network) — the agent-facing path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import shutil
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+DROPBOX_DIR_ENV = "OUTBOX_DIR"
+MAILBOX_ROOT_DIR_ENV = "MAILBOX_ROOT_DIR"
+AGENT_ID_ENV = "MAILBOX_AGENT_ID"
+
+# --- attachment carriage constants (attachments-outbound-v0.1) --------------
+ATTACH_MAX_ENV = "INBOX_ATTACH_MAX_BYTES"        # per-file courtesy cap override
+ATTACH_MAX_BYTES_DEFAULT = 25 * 1024 * 1024      # 25 MiB
+ATTACH_MAX_COUNT = 16                            # per-request attachment count cap
+_ATTACH_CHUNK_SIZE = 1024 * 1024                 # 1 MiB streaming chunk
+
+# --- MCP mode constants (inbox-submit mcp) -----------------------------
+MCP_SERVER_NAME = "inbox-lab-submit"
+MCP_SERVER_VERSION = "0.1"
+MCP_DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":
+    print(f"inbox-submit: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def expand_path(value: str) -> str:
+    """`~` and `$VAR` inside a path value the process was GIVEN.
+
+    Not a default and not a guess — the rule this file fails loud for is
+    "never invent a path nobody supplied". This only spells a supplied value
+    the way a shell would, and it is needed because an MCP registration is
+    JSON read by the host, which performs no expansion: without it every
+    value must be a substituted absolute container path, which is why the
+    host adapter carries per-sandbox placeholders at all."""
+    return os.path.expanduser(os.path.expandvars(value))
+
+
+def dropbox_dir() -> Path:
+    """`$OUTBOX_DIR` if set; else `$MAILBOX_ROOT_DIR/dropbox`; else fail
+    loud. No `__file__`-relative default, no cwd fallback — see module
+    docstring."""
+    env = os.environ.get(DROPBOX_DIR_ENV)
+    if env:
+        return Path(expand_path(env))
+    mailbox_root = os.environ.get(MAILBOX_ROOT_DIR_ENV)
+    if mailbox_root:
+        return Path(expand_path(mailbox_root)) / "dropbox"
+    die(f"set ${DROPBOX_DIR_ENV} (explicit drop-box dir) or ${MAILBOX_ROOT_DIR_ENV} "
+        f"(volume root; drop-box = $MAILBOX_ROOT_DIR/dropbox) — neither is set")
+
+
+def configured_agent_id():
+    """`$MAILBOX_AGENT_ID`, or None when it is unset or blank.
+
+    RETURNS None RATHER THAN A DEFAULT, and the difference is the whole point.
+    `agent_id` is a CROSS-CHECK, never the attribution source: a runtime
+    attributes a request to the namespace whose drop-box it was drained from
+    (AMAP core SS2), and rejects the request if a present `agent_id` disagrees
+    with it. So the field carries an assertion, and the only honest values are
+    a true one or none.
+
+    This used to default to the literal string "sandbox". That is an assertion,
+    and it is false for every instance not literally called `sandbox` — so any
+    deployment that stopped setting the variable had every submit correctly
+    rejected as an identity mismatch, which reads as a bug in the runtime. A
+    caller with nothing true to say must say nothing, which is why core SS8
+    lists the field Optional and three `valid/request-*` fixtures omit it."""
+    value = (os.environ.get(AGENT_ID_ENV) or "").strip()
+    return value or None
+
+
+# --- binding manifest startup nicety (agent-binding v0.1) --------------------
+# `$MAILBOX_ROOT_DIR/identity.json` (agent-mailbox-protocol spec/contract.md §9) is an
+# OPTIONAL, INFORMATIONAL-ONLY binding record: the volume is agent-writable,
+# so its contents are untrusted data. If present and it parses to an object
+# with a string "address", print ONE sanitized stderr line naming it — purely
+# a courtesy so the agent/operator can see what mailbox this volume is bound
+# to. Anything else (absent, malformed, huge, hostile) degrades to at most
+# one generic warning and NEVER touches stdout or crashes the process.
+_IDENTITY_FILE = "identity.json"
+_IDENTITY_MAX_BYTES = 64 * 1024
+
+
+def _sanitize_identity_address(addr: str, limit: int = 200) -> str:
+    s = "".join(c if (c.isprintable() and c not in "\r\n") else " " for c in str(addr))
+    return s.strip()[:limit]
+
+
+def check_binding_manifest() -> None:
+    mailbox_root = os.environ.get(MAILBOX_ROOT_DIR_ENV)
+    if not mailbox_root:
+        return
+    path = os.path.join(expand_path(mailbox_root), _IDENTITY_FILE)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return  # absent (or unreadable stat) -> exactly today's behavior
+    if size > _IDENTITY_MAX_BYTES:
+        print(f"inbox-submit: {_IDENTITY_FILE} present but too large to read — "
+              "ignoring (informational only)", file=sys.stderr)
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        print(f"inbox-submit: {_IDENTITY_FILE} present but unreadable/invalid — "
+              "ignoring (informational only)", file=sys.stderr)
+        return
+    if not isinstance(data, dict):
+        return
+    address = data.get("address")
+    if not isinstance(address, str) or not address:
+        return
+    print(f"inbox-submit: bound to {_sanitize_identity_address(address)} (informational)",
+          file=sys.stderr)
+
+
+# --- request builder / monotonic req_id / atomic write / result reader ------
+# (the §6 mechanic only. ORIGINATED in the workbench's JMAP core and was
+# duplicated rather than imported; that core was deleted when the lab left
+# Fastmail, so this is now the SINGLE copy and "verbatim" no longer names
+# anything. Still never imported: see module docstring.)
+
+def make_submit_request(to, subject, body_text, *, cc=None,
+                         reply_to_message_id=None, agent_id=None,
+                         req_id=None, ts=None, attachments=None) -> dict:
+    """Build a submit_draft request dict. Field-for-field match to
+    mail-cli's (and the runtime gate's) drop-box request schema — no send
+    capability, just data. contract_version is a required, pinned field
+    (agent-mailbox-protocol v2.1.0, spec/contract.md §3).
+
+    `attachments` (attachments-outbound-v0.1), if given and non-empty, is a
+    list of already-built descriptor dicts (filename/media_type/size_bytes/
+    sha256) added as `draft.attachments`; omitted entirely when empty/None —
+    an absent key, not `[]`, is the "no attachments" wire form (Q10). Callers
+    that stream sidecars via `write_submit_request(..., staged=...)` instead
+    pass `attachments=None` here and let that function fill the descriptors
+    in once the bytes are actually written."""
+    draft = {
+        "to": list(to),
+        "cc": list(cc or []),
+        "subject": subject,
+        "body_text": body_text,
+        "reply_to_message_id": reply_to_message_id,
+    }
+    if attachments:
+        draft["attachments"] = list(attachments)
+    doc = {
+        "contract_version": "2",
+        "req_id": req_id or "",
+        "ts": ts or datetime.now(timezone.utc).isoformat(),
+        "draft": draft,
+    }
+    # OMITTED, not defaulted, when nothing true is available — see
+    # configured_agent_id(). An absent key is valid under the closed
+    # submit-request schema (`required` is contract_version/req_id/draft) and
+    # is pinned by request-minimal.json; closed constrains what may be ADDED,
+    # not what must be included.
+    #
+    # Do not "restore" the default: it was the defect, not the baseline. This
+    # departed from the workbench copy this block came from, and that copy has
+    # since been deleted, so nothing can re-sync the default back in —
+    # but the rule outlives the hazard, and a reviewer who reaches for a
+    # default here should read configured_agent_id() first.
+    resolved_agent_id = agent_id or configured_agent_id()
+    if resolved_agent_id:
+        doc["agent_id"] = resolved_agent_id
+    return doc
+
+
+# --- attachment carriage (attachments-outbound-v0.1) -------------------------
+# Connector-side staging + streaming: the connector is agent-side, so reading
+# the agent's OWN source files crosses no privilege boundary (D4) — the real
+# security boundary is what gets WRITTEN into the shared drop-box, and every
+# component of that write path is connector-minted (req_id digits + an
+# enumerate() ordinal), never an agent-supplied string. See module docstring
+# and README.md for the full picture.
+
+def sanitize_display_filename(raw, limit: int = 120) -> str:
+    """Coerce an attachment filename into a safe DISPLAY string — never a
+    path (agent-mailbox-protocol invariant 3: filename is display-only). Drops
+    non-printable chars and CR/LF, maps path separators to '_' (belt-and-
+    braces — nothing here is ever used to build a filesystem path), collapses
+    whitespace runs, strips, truncates to `limit`. Empty after cleaning ⇒
+    "(unnamed)". Same rules as the inbound notice writer's sanitizer
+    (amp-simple-email-router's notice_writer.py) — kept as an independent copy here
+    per invariant 7 (the connector never trusts the runtime's cleaning
+    alone, and vice versa)."""
+    s = "" if raw is None else str(raw)
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = "".join(c for c in s if c.isprintable())
+    s = s.replace("/", "_").replace("\\", "_")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s[:limit]
+    return s or "(unnamed)"
+
+
+def _attach_max_bytes() -> int:
+    """`$INBOX_ATTACH_MAX_BYTES` if set to a positive integer, else the
+    25 MiB default. A courtesy/ergonomics cap (invariant 7) — the real
+    control is the runtime's fail-closed hold, not this."""
+    raw = os.environ.get(ATTACH_MAX_ENV)
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = None
+        if value is not None and value > 0:
+            return value
+    return ATTACH_MAX_BYTES_DEFAULT
+
+
+def stage_attachment_inputs(specs) -> list:
+    """Normalize + validate the agent's attachment inputs — CLI bare path
+    strings or MCP `{path, filename?, media_type?}` dicts — BEFORE anything
+    touches the drop-box. Returns `[{src: Path, filename: str,
+    media_type: str}, ...]` in the given order (this order becomes the
+    0-based sidecar ordinal == descriptor array index, the sole binding
+    authority per the seam spec).
+
+    Raises SubmitError on any invalid input (bad shape, missing file,
+    non-regular file, too many attachments, oversize file) — callers decide
+    how to surface that (MCP: turn into isError content; CLI: `die`)."""
+    if not isinstance(specs, list):
+        raise SubmitError("submit: 'attachments' must be an array")
+    if len(specs) > ATTACH_MAX_COUNT:
+        raise SubmitError(
+            f"submit: at most {ATTACH_MAX_COUNT} attachments allowed "
+            f"(got {len(specs)})")
+    max_bytes = _attach_max_bytes()
+    staged = []
+    for i, spec in enumerate(specs):
+        if isinstance(spec, str):
+            path_raw, filename_raw, media_type_raw = spec, None, None
+        elif isinstance(spec, dict):
+            allowed = {"path", "filename", "media_type"}
+            extra = sorted(set(spec) - allowed)
+            if extra:
+                raise SubmitError(
+                    f"submit: attachments[{i}]: unknown field(s): {', '.join(extra)}")
+            path_raw = spec.get("path")
+            filename_raw = spec.get("filename")
+            media_type_raw = spec.get("media_type")
+            if filename_raw is not None and not isinstance(filename_raw, str):
+                raise SubmitError(f"submit: attachments[{i}]: 'filename' must be a string")
+            if media_type_raw is not None and not isinstance(media_type_raw, str):
+                raise SubmitError(f"submit: attachments[{i}]: 'media_type' must be a string")
+        else:
+            raise SubmitError(
+                f"submit: attachments[{i}]: must be a path string or an object with 'path'")
+        if not isinstance(path_raw, str) or not path_raw:
+            raise SubmitError(
+                f"submit: attachments[{i}]: 'path' is required and must be a non-empty string")
+
+        src = Path(path_raw)
+        if not src.exists():
+            raise SubmitError(f"submit: attachments[{i}]: no such file: {path_raw!r}")
+        if not src.is_file():
+            raise SubmitError(f"submit: attachments[{i}]: not a regular file: {path_raw!r}")
+        try:
+            size = src.stat().st_size
+        except OSError as e:
+            raise SubmitError(f"submit: attachments[{i}]: cannot stat {path_raw!r}: {e}")
+        if size > max_bytes:
+            raise SubmitError(
+                f"submit: attachments[{i}]: {path_raw!r} is {size} bytes, "
+                f"exceeds the {max_bytes}-byte cap (${ATTACH_MAX_ENV} to raise it)")
+
+        filename = sanitize_display_filename(filename_raw or os.path.basename(path_raw))
+        media_type = media_type_raw or (mimetypes.guess_type(path_raw)[0]
+                                         or "application/octet-stream")
+        staged.append({"src": src, "filename": filename, "media_type": media_type})
+    return staged
+
+
+def _remove_orphan_sidecar_dir(side_dir: Path) -> None:
+    """Remove a stale sidecar dir left over from a crashed earlier attempt at
+    this SAME req_id, if present. Provably an orphan: `_next_req_id` scans
+    every committed request (pending + processed + results), so no committed
+    request can own this id — this can only be debris from a process that
+    died between minting the id and writing the request JSON (the commit
+    sentinel), since the JSON write is what publishes a request."""
+    if side_dir.is_symlink():
+        try:
+            side_dir.unlink()
+        except OSError:
+            pass
+        return
+    if side_dir.is_dir():
+        shutil.rmtree(side_dir, ignore_errors=True)
+    elif side_dir.exists():
+        try:
+            side_dir.unlink()
+        except OSError:
+            pass
+
+
+def _write_sidecar(side_dir: Path, index: int, spec: dict, max_bytes: int) -> dict:
+    """Stream one staged input into `side_dir/<index>` (`.tmp` + os.replace),
+    computing sha256 + byte count over the DECODED bytes in the same pass —
+    the descriptor is guaranteed to describe exactly what landed on disk.
+    Re-enforces the size cap while streaming (courtesy cap, invariant 7) so a
+    file that grows between staging and this write still fails cleanly."""
+    tmp_path = side_dir / f"{index}.tmp"
+    final_path = side_dir / str(index)
+    digest = hashlib.sha256()
+    size = 0
+    with open(spec["src"], "rb") as fsrc, open(tmp_path, "wb") as fdst:
+        while True:
+            chunk = fsrc.read(_ATTACH_CHUNK_SIZE)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise SubmitError(
+                    f"submit: attachments[{index}]: grew past the {max_bytes}-byte "
+                    f"cap while streaming (${ATTACH_MAX_ENV} to raise it)")
+            digest.update(chunk)
+            fdst.write(chunk)
+    os.replace(tmp_path, final_path)
+    return {
+        "filename": spec["filename"],
+        "media_type": spec["media_type"],
+        "size_bytes": size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _next_req_id(d: Path) -> str:
+    """Monotonic next id = 1 + max id seen across pending req files, processed
+    req files, AND results. Counting only *pending* files resets to 0 once
+    the relay drains the drop-box, so ids collide across sends — and since a
+    downstream message-id can be derived from req_id, an idempotency key
+    could dedupe a resend as an earlier send. Scanning all three locations
+    keeps ids unique for the life of the drop-box."""
+    seen: set = set()
+    for pat in ("req-*.json", "processed/req-*.json", "results/*.json"):
+        for p in d.glob(pat):
+            num = p.stem[4:] if p.stem.startswith("req-") else p.stem
+            if num.isdigit():
+                seen.add(int(num))
+    return f"{(max(seen) + 1) if seen else 0:08d}"
+
+
+def write_submit_request(dropbox, request: dict, staged=None) -> tuple:
+    """Atomically write a submit_draft request file (.tmp + os.replace);
+    assigns a monotonic req_id (see _next_req_id). Returns (req_id, path).
+
+    `staged` (attachments-outbound-v0.1), if given and non-empty, is the
+    `stage_attachment_inputs(...)` output: req_id is assigned FIRST, any
+    orphaned sidecar dir at that id is removed, then each staged input is
+    streamed in ordinal order into the sidecar dir (`.tmp` + os.replace per
+    file) and its descriptor is merged into `request["draft"]["attachments"]`
+    — all of that happens BEFORE the request JSON itself is written. The
+    request JSON's `os.replace` is always the LAST write: its presence is the
+    sole commit sentinel (agent-mailbox-protocol spec/attachments-v0.1.md §2).
+    On any failure before that point, the partially-written sidecar dir is
+    best-effort removed and the exception propagates — nothing was
+    published (no JSON = no request)."""
+    d = Path(dropbox)
+    d.mkdir(parents=True, exist_ok=True)
+    req_id = request.get("req_id") or _next_req_id(d)
+    request = {**request, "req_id": req_id}
+    path = d / f"req-{req_id}.json"
+    if staged:
+        side_dir = d / f"req-{req_id}.attachments"
+        try:
+            _remove_orphan_sidecar_dir(side_dir)
+            side_dir.mkdir(parents=True)
+            max_bytes = _attach_max_bytes()
+            descriptors = [_write_sidecar(side_dir, i, spec, max_bytes)
+                           for i, spec in enumerate(staged)]
+        except Exception:
+            shutil.rmtree(side_dir, ignore_errors=True)
+            raise
+        request = {**request,
+                   "draft": {**request["draft"], "attachments": descriptors}}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(json.dumps(request, indent=2).encode("utf-8"))
+    os.replace(tmp, path)
+    return req_id, path
+
+
+def read_submit_result(dropbox, req_id: str):
+    """Read results/<req_id>.json if present (relay has processed the
+    request); None if still pending. Read-only, no network."""
+    path = Path(dropbox) / "results" / f"{req_id}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+# --- end duplication ---------------------------------------------------
+
+
+# --- MCP mode (inbox-submit mcp) ----------------------------------------
+# stdio JSON-RPC server exposing the §6 outbound mechanic as two MCP tools,
+# mirroring inbox-mcp-vol's protocol shell (initialize / notifications/
+# initialized / tools/list / tools/call / ping; -32601 unknown; isError
+# content, never a crash; stdout protocol-pure — all logs/diagnostics go to
+# stderr). Reuses make_submit_request / write_submit_request /
+# read_submit_result / dropbox_dir above verbatim; adds NO read tool and NO
+# send capability — `submit` only ever writes an inert drop-box request.
+
+MCP_INSTRUCTIONS = (
+    "This server writes GATED outbound-mail requests. It has no send "
+    "capability and makes no network calls: `submit` writes an inert "
+    "drop-box request that a host-side relay reads, applies the recipient "
+    "allowlist/policy against, and may hold it for a human to approve "
+    "(queued_for_human) or reject it. The message is NOT 'sent' until "
+    "submit_result reports outcome 'accepted' — call it with the req_id "
+    "`submit` returns to check status. There is no read tool here by "
+    "design: reading inbound mail goes through the inbox-mcp-vol server, "
+    "never this one. `submit` also accepts an `attachments` list (local "
+    "file paths) — the bytes are carried into the drop-box and the relay "
+    "decides the outcome. On the peer lane, attachment-bearing requests "
+    "have been observed to be accepted and delivered with NO human step. "
+    "Nothing screens attachment content — there is no DLP or AV screener "
+    "in this path. Treat yourself as the last check: submit only what you "
+    "would send knowing it reaches the recipient directly. Call "
+    "submit_result for the outcome — the status returned here is a "
+    "RECEIPT, not a VERDICT."
+)
+
+MCP_TOOLS = [
+    {
+        "name": "submit",
+        "description": (
+            "Write a GATED outbound-mail request — this does NOT send mail. "
+            "A host-side relay reads the request, applies the recipient "
+            "allowlist/policy, and may queue it for a human "
+            "(queued_for_human) or reject it; it is only 'sent' once "
+            "submit_result reports outcome 'accepted'. Returns "
+            "{req_id, status: \"queued\"}; call submit_result with that "
+            "req_id to check the outcome. If `attachments` is given, the "
+            "files are carried into the drop-box and the relay decides; on "
+            "the peer lane these have been observed accepted and delivered "
+            "with NO human step, and nothing screens attachment content. "
+            "Treat yourself as the last check."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "recipient email address(es)",
+                },
+                "cc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "cc recipient email address(es)",
+                },
+                "subject": {"type": "string", "description": "subject line"},
+                "body_text": {"type": "string", "description": "plain-text body"},
+                "in_reply_to": {
+                    "type": "string",
+                    "description": "message id being replied to, if any",
+                },
+                "attachments": {
+                    "type": "array",
+                    "maxItems": ATTACH_MAX_COUNT,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string",
+                                     "description": "local file path to attach"},
+                            "filename": {"type": "string",
+                                         "description": "display filename override (optional)"},
+                            "media_type": {"type": "string",
+                                           "description": "MIME type override (optional)"},
+                        },
+                        "required": ["path"],
+                        "additionalProperties": False,
+                    },
+                    "description": (
+                        "files to attach (repeatable); carried into the drop-box as "
+                        "sidecars alongside the request. The relay decides the "
+                        "outcome — on the peer lane these have been observed "
+                        "accepted and delivered with NO human step, and nothing "
+                        "screens attachment content (no DLP/AV screener in this "
+                        "path). Treat yourself as the last check."
+                    ),
+                },
+            },
+            "required": ["to", "body_text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "submit_result",
+        "description": (
+            "Check the outcome of a previously-submitted request by its "
+            "req_id. Returns the relay's verdict (outcome: accepted / "
+            "queued_for_human / rejected, + detail, + optional reason_code "
+            "naming which policy path authorized or refused) once "
+            "processed, or the text 'pending' if the relay hasn't answered "
+            "yet."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "req_id": {"type": "string", "description": "req_id returned by submit"},
+            },
+            "required": ["req_id"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+class SubmitError(Exception):
+    """Any submit/submit_result tool-call failure (bad input, bad req_id,
+    unreadable result) — always surfaces as isError, never a crash."""
+
+
+# Conservative charset for an agent-supplied req_id: mirrors inbox-mcp-vol's
+# `_SAFE_ID` exactly (letters, digits, underscore, dot, hyphen; no leading
+# '.', no '/', no whitespace, no NUL).
+_SAFE_REQ_ID = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9_.-]{0,199}\Z")
+
+
+def safe_req_id(raw) -> str:
+    """Validate `raw` as a bare filename component (basename-only) before it
+    ever touches a path join — mirrors inbox-mcp-vol's safe_id(). Raises
+    SubmitError instead of ever returning something that could escape
+    results/.
+
+    Belt-and-braces, three independent checks:
+      1. charset/shape regex (no '/', no leading '.', safe chars only)
+      2. no '..' substring anywhere (defense in depth even though the
+         regex's leading-char rule already excludes a pure '..')
+      3. os.path.basename(raw) == raw (no separator, of any flavor, survived)
+    A bad id is a clean SubmitError -> isError, never a read outside results/.
+    """
+    if not isinstance(raw, str) or not raw:
+        raise SubmitError("submit_result: 'req_id' is required")
+    if not _SAFE_REQ_ID.match(raw):
+        raise SubmitError(f"submit_result: invalid req_id {raw!r}")
+    if ".." in raw or "/" in raw or "\\" in raw:
+        raise SubmitError(f"submit_result: invalid req_id {raw!r}")
+    if os.path.basename(raw) != raw:
+        raise SubmitError(f"submit_result: invalid req_id {raw!r}")
+    return raw
+
+
+def resolve_result_path(dropbox, req_id: str) -> Path:
+    """Join req_id onto dropbox/results and re-verify (post os.path.realpath)
+    that the result is still contained in dropbox/results — the final guard
+    against a symlinked results/ entry pointing outside it (mirrors
+    inbox-mcp-vol's resolve_message_path)."""
+    base = Path(dropbox) / "results"
+    candidate = base / f"{req_id}.json"
+    real_base = os.path.realpath(str(base))
+    real_candidate = os.path.realpath(str(candidate))
+    if real_candidate != real_base and not real_candidate.startswith(real_base + os.sep):
+        raise SubmitError(f"submit_result: req_id {req_id!r} resolves outside results/")
+    return candidate
+
+
+def mcp_log(msg: str) -> None:
+    print(f"inbox-submit: {msg}", file=sys.stderr, flush=True)
+
+
+def mcp_send(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def mcp_respond(id_, result) -> None:
+    mcp_send({"jsonrpc": "2.0", "id": id_, "result": result})
+
+
+def mcp_respond_error(id_, code, message) -> None:
+    mcp_send({"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}})
+
+
+def text_content(s: str) -> dict:
+    return {"content": [{"type": "text", "text": s}]}
+
+
+def error_content(s: str) -> dict:
+    return {"content": [{"type": "text", "text": s}], "isError": True}
+
+
+def tool_submit(args: dict) -> dict:
+    to_raw = args.get("to")
+    if not isinstance(to_raw, list) or not all(isinstance(x, str) for x in to_raw):
+        return error_content("submit: 'to' is required and must be an array of strings")
+    to = [t.strip() for t in to_raw if isinstance(t, str) and t.strip()]
+    if not to:
+        return error_content("submit: 'to' must contain at least one non-empty address")
+
+    cc_raw = args.get("cc") if args.get("cc") is not None else []
+    if not isinstance(cc_raw, list) or not all(isinstance(x, str) for x in cc_raw):
+        return error_content("submit: 'cc' must be an array of strings")
+    cc = [c.strip() for c in cc_raw if isinstance(c, str) and c.strip()]
+
+    subject = args.get("subject")
+    if subject is None:
+        subject = ""
+    if not isinstance(subject, str):
+        return error_content("submit: 'subject' must be a string")
+
+    body_text = args.get("body_text")
+    if not isinstance(body_text, str) or not body_text:
+        return error_content("submit: 'body_text' is required and must be a non-empty string")
+
+    in_reply_to = args.get("in_reply_to")
+    if in_reply_to is not None and not isinstance(in_reply_to, str):
+        return error_content("submit: 'in_reply_to' must be a string")
+
+    staged = None
+    attachments_raw = args.get("attachments")
+    if attachments_raw is not None:
+        try:
+            staged = stage_attachment_inputs(attachments_raw)
+        except SubmitError as e:
+            return error_content(str(e))
+
+    request = make_submit_request(
+        to, subject, body_text, cc=cc, reply_to_message_id=in_reply_to)
+    req_id, _path = write_submit_request(dropbox_dir(), request, staged=staged)
+    result = {"req_id": req_id, "status": "queued"}
+    if staged:
+        result["attachments"] = len(staged)
+        result["note"] = (
+            "the relay decides the outcome; do not assume a human reviews it. "
+            "Nothing screens attachment content (no DLP/AV screener in this path). "
+            "Call submit_result for the verdict — this status is a receipt, not one"
+        )
+    return text_content(json.dumps(result))
+
+
+def tool_submit_result(args: dict) -> dict:
+    raw = args.get("req_id")
+    try:
+        req_id = safe_req_id(raw)
+        result_path = resolve_result_path(dropbox_dir(), req_id)
+    except SubmitError as e:
+        return error_content(str(e))
+    if not result_path.is_file():
+        return text_content("pending")
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return error_content(f"submit_result: cannot read result: {e}")
+    lines = []
+    attestation = result.get("attestation") if isinstance(result, dict) else None
+    if attestation:
+        # Surfacing only (AMP §4) — never verified here, just labeled.
+        form = attestation.get("form")
+        lines.append(
+            "attestation: verifiable" if form == "verifiable"
+            else f"attestation: {form or 'self-stamp'} (runtime-applied, not stranger-verifiable)"
+        )
+    lines.append(json.dumps(result, indent=2))
+    return text_content("\n".join(lines))
+
+
+MCP_DISPATCH = {
+    "submit": tool_submit,
+    "submit_result": tool_submit_result,
+}
+
+
+def mcp_handle_initialize(req: dict) -> None:
+    params = req.get("params") or {}
+    proto = params.get("protocolVersion") or MCP_DEFAULT_PROTOCOL_VERSION
+    mcp_respond(req.get("id"), {
+        "protocolVersion": proto,
+        "serverInfo": {"name": MCP_SERVER_NAME, "version": MCP_SERVER_VERSION},
+        "capabilities": {"tools": {}},
+        "instructions": MCP_INSTRUCTIONS,
+    })
+
+
+def mcp_handle_tools_list(req: dict) -> None:
+    mcp_respond(req.get("id"), {"tools": MCP_TOOLS})
+
+
+def mcp_handle_tools_call(req: dict) -> None:
+    id_ = req.get("id")
+    params = req.get("params") or {}
+    name = params.get("name")
+    args = params.get("arguments") or {}
+    if not isinstance(args, dict):
+        args = {}
+    fn = MCP_DISPATCH.get(name)
+    if fn is None:
+        mcp_respond_error(id_, -32602, f"unknown tool: {name}")
+        return
+    try:
+        value = fn(args)
+    except SubmitError as e:
+        value = error_content(str(e))
+    except Exception as e:  # a tool bug must never take the server down
+        mcp_log(f"tool {name!r} raised {type(e).__name__}: {e}")
+        value = error_content(f"internal error in {name}: {e}")
+    mcp_respond(id_, value)
+
+
+def mcp_handle_ping(req: dict) -> None:
+    mcp_respond(req.get("id"), {})
+
+
+MCP_METHODS = {
+    "initialize": mcp_handle_initialize,
+    "tools/list": mcp_handle_tools_list,
+    "tools/call": mcp_handle_tools_call,
+    "ping": mcp_handle_ping,
+}
+
+
+def mcp_dispatch(req: dict) -> None:
+    method = req.get("method")
+    id_ = req.get("id")
+    if method == "notifications/initialized":
+        return  # notification: no response, ever
+    handler = MCP_METHODS.get(method)
+    if handler is None:
+        if id_ is not None:
+            mcp_respond_error(id_, -32601, f"method not found: {method}")
+        return
+    handler(req)
+
+
+def cmd_mcp(args) -> None:
+    dropbox_dir()  # fail loud on bad config BEFORE the stdio loop, never mid-request
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except json.JSONDecodeError as e:
+            mcp_log(f"malformed JSON-RPC line ignored: {e}")
+            continue
+        if not isinstance(req, dict):
+            mcp_log("ignored non-object JSON-RPC line")
+            continue
+        id_ = req.get("id")
+        try:
+            mcp_dispatch(req)
+        except Exception as e:  # last-resort: never let dispatch kill the process
+            mcp_log(f"unhandled error dispatching {req.get('method')!r}: {e}")
+            if id_ is not None:
+                mcp_respond_error(id_, -32603, f"internal error: {e}")
+
+
+# --- end MCP mode --------------------------------------------------------
+
+
+def read_body(args) -> str:
+    if args.body is not None:
+        return args.body
+    if sys.stdin.isatty():
+        die("no --body given and stdin is a TTY; pipe the body in or pass --body")
+    return sys.stdin.read()
+
+
+def cmd_submit(args) -> None:
+    to = [a.strip() for a in args.to.split(",") if a.strip()]
+    cc = [a.strip() for a in args.cc.split(",") if a.strip()] if args.cc else []
+    staged = None
+    if args.attach:
+        try:
+            staged = stage_attachment_inputs(list(args.attach))
+        except SubmitError as e:
+            die(str(e))
+    request = make_submit_request(
+        to, args.subject, read_body(args),
+        cc=cc, reply_to_message_id=args.reply_to_id)
+    dropbox = dropbox_dir()
+    req_id, path = write_submit_request(dropbox, request, staged=staged)
+    result_path = dropbox / "results" / f"{req_id}.json"
+    print(f"Submitted request {req_id} to the relay drop-box ({path}).")
+    print(f"Result will appear at: {result_path}")
+    if staged:
+        print(f"Attached {len(staged)} file(s) — the relay decides the outcome; "
+              f"do not assume a human reviews it. Call submit_result for the verdict.")
+
+
+def cmd_submit_result(args) -> None:
+    result = read_submit_result(dropbox_dir(), args.req_id)
+    if result is None:
+        print("pending")
+        return
+    print(json.dumps(result, indent=2))
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="inbox-submit", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    psu = sub.add_parser("submit")
+    psu.add_argument("--to", required=True, help="recipient(s), comma-separated")
+    psu.add_argument("--cc", default="", help="cc recipient(s), comma-separated")
+    psu.add_argument("--subject", default="", help="subject line")
+    psu.add_argument("--body", help="body text (or pipe via stdin)")
+    psu.add_argument("--reply-to-id", help="message id being replied to")
+    psu.add_argument("--attach", action="append", default=None, metavar="PATH",
+                      help="attach a local file (repeatable); the relay decides "
+                           "the outcome — do not assume a human reviews it")
+    psu.set_defaults(fn=cmd_submit)
+
+    psr = sub.add_parser("submit-result")
+    psr.add_argument("req_id", help="req_id printed by `submit`")
+    psr.set_defaults(fn=cmd_submit_result)
+
+    pmc = sub.add_parser("mcp", help="run as a stdio MCP server (submit + submit_result tools)")
+    pmc.set_defaults(fn=cmd_mcp)
+
+    args = p.parse_args(argv)
+    check_binding_manifest()
+    args.fn(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

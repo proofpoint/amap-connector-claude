@@ -1,0 +1,26 @@
+{
+  "_comment": "Claude Code inbox connector registration. COPY this to your workspace root as .mcp.json (Claude Code auto-discovers .mcp.json at the launch cwd), then edit the paths below for your deployment. THE PATHS HERE ARE PLACEHOLDERS, NOT DEFAULTS: point each server at the directories your host actually provides. Each tool resolves its directory from its own explicit variable first (INBOX_MESSAGE_DIR for the readers, OUTBOX_DIR for the sender), and falls back to MAILBOX_ROOT_DIR only when that is unset -- in which case the spool is $MAILBOX_ROOT_DIR/messages and the drop-box is $MAILBOX_ROOT_DIR/dropbox. A host whose volume is not laid out that way should set the explicit variables instead, which is the portable choice. The connector is transport-agnostic: it reads a volume, and which runtime fills that volume is the runtime's concern, not this repo's. `inbox` and `delegation` are THE SAME BINARY pointed at different lanes via INBOX_LANE (mail is the default); register only the lanes your deployment runs. `inbox-submit` is kept as a SEPARATE server from the readers so a read-only deployment can omit the sender -- its `submit` tool only ever writes a drop-box request that a host-side relay acts on, never a direct send. Nothing here PUSHES: a new notice reaches a live session through bin/inbox-delivery, a daemon the host runs beside the session, not through an MCP server.",
+  "mcpServers": {
+    "inbox": {
+      "command": "amap-connector-claude/bin/inbox-mcp-vol",
+      "env": {
+        "INBOX_MESSAGE_DIR": "/path/to/volume/inbox/messages",
+        "INBOX_LANE": "mail"
+      }
+    },
+    "delegation": {
+      "command": "amap-connector-claude/bin/inbox-mcp-vol",
+      "env": {
+        "INBOX_MESSAGE_DIR": "/path/to/volume/peer/messages",
+        "INBOX_LANE": "peer"
+      }
+    },
+    "inbox-submit": {
+      "command": "amap-connector-claude/bin/inbox-submit",
+      "args": ["mcp"],
+      "env": {
+        "OUTBOX_DIR": "/path/to/volume/outbox"
+      }
+    }
+  }
+}

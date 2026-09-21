@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-code-inbox-connector"
+version = "0.1.0"
+description = "Claude Code reference connector for agent-mailbox-protocol: MCP read (inbox-mcp-vol), outbound submit (inbox-submit), and the in-sandbox delivery daemon (inbox-delivery). Stdlib-only, zero deps."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+# The tools are single-file, shebang'd, executable stdlib scripts under
+# bin/ (house style) — they run straight off PATH with ZERO install. This
+# pyproject exists so `pip install .` is *optional*: `script-files` installs
+# the same bin/ scripts verbatim into the environment's bin/ dir (no wrapper,
+# no importable package, no behavior difference from running them in place).
+#
+# ONE private module, bin/_inboxlib.py, holds the consumer claim used by
+# inbox-delivery and is LOADED BY PATH — each script resolves it relative to
+# its own __file__. It is not a package and is never imported by name, which
+# is why it is listed here beside the scripts: it has to land in the same
+# bin/ directory they do, or the installed copies cannot find it.
+[tool.setuptools]
+script-files = [
+    "bin/inbox-mcp-vol",
+    "bin/inbox-submit",
+    "bin/inbox-delivery",
+    "bin/_inboxlib.py",
+]
