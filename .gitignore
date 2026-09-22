@@ -3,6 +3,14 @@ __pycache__/
 
 .DS_Store
 
+# Build artifacts. `pip install .` is optional here — the tools run straight
+# off bin/ from a checkout — but running it leaves these in the tree, and a
+# snapshot built by copying the working directory would carry them.
+build/
+dist/
+*.egg-info/
+.eggs/
+
 # Per-machine / per-sandbox local config — never part of the package, and
 # kept out by LOCATION so `git add -A` (or a fresh snapshot's add) cannot
 # sweep them in regardless of today's contents.
