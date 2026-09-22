@@ -91,25 +91,22 @@ pointed at the wrong (or an empty) spool once extracted.
 
 ## Registering with Claude Code / sandy
 
-Ship-and-`cp`: **[`.mcp.json.example`](.mcp.json.example)** is a ready registration
-of both servers (`inbox`, `inbox-submit`), using
-workspace-root-relative paths so it works verbatim once two conventions hold
-(the runbooks standardize them):
-
-1. a symlink `amap-connector-claude` → this repo, at the workspace root;
-2. the shared `.amp` volume at the workspace root.
+**[`.mcp.json.example`](.mcp.json.example)** registers all three MCP servers —
+`inbox` and `delegation` (the same binary on different lanes) and
+`inbox-submit`. **The paths in it are placeholders, not defaults**: point each
+server at the directories your host actually provides.
 
 ```sh
 cd <workspace>
-ln -s /path/to/amap-connector-claude amap-connector-claude   # convention (1)
+ln -s /path/to/amap-connector-claude amap-connector-claude
 cp amap-connector-claude/.mcp.json.example .mcp.json
-sandy                                     # .mcp.json auto-discovered at cwd
+$EDITOR .mcp.json            # replace the placeholder paths
 ```
 
-Both `command` and `MAILBOX_ROOT_DIR` resolve against the launch cwd (= the workspace
-root), so run `sandy` from there. `MAILBOX_ROOT_DIR` may be relative (`.amp`, the
-common case) or absolute (a workspace binding a *different* agent identity/volume
-points it at that agent's volume). Nothing in `.mcp.json` pushes: a new notice
+The volume's location and layout are the host's, not this repo's, and they vary:
+set each tool's explicit variable (`INBOX_MESSAGE_DIR`, `OUTBOX_DIR`) when the
+volume is not laid out as `<root>/messages` + `<root>/dropbox`, which is the only
+shape `MAILBOX_ROOT_DIR` can derive. Nothing in `.mcp.json` pushes: a new notice
 reaches the live session through `bin/inbox-delivery`, which the host runs
 beside the session (under sandy, from its read-only relay slot, installed by
 `amap-adapter-sandy`).
@@ -126,8 +123,8 @@ no direct-send path on this server; it makes no network calls itself.
 The CLI front-end is unchanged and still there for host scripting /
 host-side scripting — invoke it directly:
 ```sh
-MAILBOX_ROOT_DIR=/path/to/your/.amp bin/inbox-submit submit --to a@example.com --subject hi --body 'hello'
-MAILBOX_ROOT_DIR=/path/to/your/.amp bin/inbox-submit submit-result <req_id>
+OUTBOX_DIR=/path/to/volume/outbox bin/inbox-submit submit --to a@example.com --subject hi --body 'hello'
+OUTBOX_DIR=/path/to/volume/outbox bin/inbox-submit submit-result <req_id>
 ```
 
 ## Delivery — `bin/inbox-delivery`
@@ -190,7 +187,7 @@ bad input (missing file, non-regular file, over-cap) fails before anything
 touches the drop-box.
 
 ```sh
-MAILBOX_ROOT_DIR=/path/to/your/.amp bin/inbox-submit submit --to a@example.com \
+OUTBOX_DIR=/path/to/volume/outbox bin/inbox-submit submit --to a@example.com \
   --subject "see attached" --body 'hello' --attach ./report.pdf --attach ./notes.txt
 ```
 
