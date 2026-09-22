@@ -144,9 +144,7 @@ where no router can write; writes a per-notice outcome file
 (`outbound/ext/claude-code/outcomes/`) the router reads as a
 claim, never as proof; refuses when it cannot identify a single target
 session; and holds no allowlist — authorisation on the peer lane is the
-router's, evidenced by the read-only mount. `NOT-FOR-PUBLICATION/delivery_design.md` is the
-architecture, `NOT-FOR-PUBLICATION/RULINGS.md` the decisions, `NOT-FOR-PUBLICATION/uds_findings.md` the measured
-wire it speaks.
+router's, evidenced by the read-only mount.
 
 ### Inbound attachments (amap-spec v2.3.0 §5)
 

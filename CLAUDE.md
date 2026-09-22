@@ -69,8 +69,8 @@ against **the spec's own** `fixtures/validate.py`, loaded by path from a sibling
 checkout is absent the test **skips, loudly** — *a skipped validation is not a
 passed one*; check for `s` in the output before believing the schema is pinned.
 
-Real injection into a real session is `NOT-FOR-PUBLICATION/spikes/uds_inject_spike.py`, run by hand.
-It is not a unit test and must not become one.
+Real injection into a real session is done by hand with a spike that is not
+distributed here. It is not a unit test and must not become one.
 
 ## Conventions a newcomer would otherwise violate
 
@@ -90,8 +90,7 @@ This repo earned the rule the hard way, twice, both recorded in its own text:
   behaves the way the real one was *measured* to behave (silent under `accept`;
   under `refuse` the inbound connection stalls open and the refusal arrives
   ~1 ms later at the reply socket the sender bound).
-- **A vacuous cleanup test.** Recorded in `NOT-FOR-PUBLICATION/RULINGS.md` (ruling 15, adapter
-  round 5): it made a directory unwritable and asserted no temp
+- **A vacuous cleanup test.** Recorded as ruling 15: it made a directory unwritable and asserted no temp
   file was left — but an unwritable directory never lets one be created, so the
   cleanup path was never reached and the mutation stayed **GREEN**.
 
@@ -297,19 +296,13 @@ this worktree: judge a sha, not the tree.
 
 ## Where the "why" lives
 
-This repo's design record is large and is the point — it holds decisions and
-their measurements, not just outcomes. Read the relevant one before changing
-behaviour:
-
-| file | what it records |
-|---|---|
-| `NOT-FOR-PUBLICATION/delivery_design.md` | the architecture of the delivery daemon and the peer lane; §10 is the daemon's contract, §10.z rulings 15 and 16 in full |
-| `NOT-FOR-PUBLICATION/RULINGS.md` | **every decision with its rationale and where it is implemented**: rulings 1–16 (14 = the receipt model; 15 = the wrapper does host-variable translation; 16 = the router authorises), the counterparts' corrections, the router's pushbacks, the six sandy asks. The round-trip correspondence that produced them was folded in and retired 2026-09-15 |
-| `NOT-FOR-PUBLICATION/uds_findings.md` | the measured UDS wire: framing, the anchored envelope regex (§5.1), out-of-band receipts (§8) |
-| `NOT-FOR-PUBLICATION/alternatives_considered.md`, `channel_roadmap.md` | rejected designs and what is deliberately not built |
-
-Rulings are cited by number throughout the source. When source and a design
-record disagree, that is a finding — report it, do not pick one silently.
+This repo's design record — the architecture of the delivery daemon and the
+peer lane, every decision with its rationale, the measured UDS wire, and the
+designs that were rejected — is held privately and is not distributed with the
+source. Rulings are cited by number throughout the code; those numbers index
+that record, so the reasoning behind a guard is not reconstructable from this
+repository alone. When the source and a cited ruling appear to disagree, that
+is a finding — report it, do not pick one silently.
 
 ## Non-obvious things the code does not say
 
@@ -339,6 +332,6 @@ run together — the channel started its watcher before the stdio loop, so
 merely registering it made a second consumer of the spool, and the loser's
 notices were silently lost; the consumer claim in `_inboxlib.py` (born in the
 channel) is what made that loud. Channel mode was retired from the fleet on
-2026-09-10 (`NOT-FOR-PUBLICATION/RULINGS.md` ruling 5) and the binary, its tests and the
+2026-09-10 (ruling 5) and the binary, its tests and the
 conformance harness's channel tests were deleted on 2026-09-15 (inbox-lab
 janitorial #11). Git history before that date has the file.

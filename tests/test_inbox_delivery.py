@@ -4,8 +4,7 @@ Every test starts bin/inbox-delivery as a subprocess against temporary trees,
 a fake session-source script and a fake UDS receiver, and asserts only on what
 lands on disk or on the wire. Nothing here imports the daemon.
 
-THE RECEIVER MODEL IS THE MEASURED ONE (NOT-FOR-PUBLICATION/uds_findings.md §8; sandy's
-CROSS_SESSION_INBOUND.md §6a, 2.1.263, 2026-09-07). The fake accepts the
+THE RECEIVER MODEL IS THE MEASURED ONE (2.1.263, 2026-09-07). The fake accepts the
 inbound connection, reads auth + user, and then NEVER writes on it — under
 `accept` the real receiver is silent on every channel, and under `refuse` the
 inbound connection stalls open. Receipts, when the script has any, are
@@ -15,8 +14,7 @@ well-shaped (basename matching the receiver's regex). The first version of
 this suite scripted receipts on the inbound connection; sixteen tests passed
 against a protocol that does not exist. Never again.
 
-Real injection into a real session is NOT-FOR-PUBLICATION/spikes/uds_inject_spike.py, not a unit
-test. Self-contained, stdlib-only, unittest-compatible (also pytest-collectible).
+Real injection into a real session is a by-hand spike, not a unit test. Self-contained, stdlib-only, unittest-compatible (also pytest-collectible).
 """
 
 from __future__ import annotations

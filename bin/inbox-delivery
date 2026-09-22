@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""inbox-delivery — the in-sandbox delivery daemon (NOT-FOR-PUBLICATION/delivery_design.md §10).
+"""inbox-delivery — the in-sandbox delivery daemon.
 
 Watches two inbound trees the runtime writes and performs the LAST HOP into a
 live Claude Code session over its Unix domain socket. No router speaks UDS —
@@ -57,8 +57,8 @@ None -> wait and re-poll; sandy no longer starts the relay under --remote, so
 "no panes ever" needs no special case.
 
 The envelope — this daemon OWNS it. Claude Code parses the sender's identity
-and class claim out of the CONTENT STRING with an anchored regex
-(NOT-FOR-PUBLICATION/uds_findings.md §5.1). So a body is never sent as the whole content: every
+and class claim out of the CONTENT STRING with an anchored regex, measured
+against a live session. So a body is never sent as the whole content: every
 injected string is
 
     <cross-session-message from-name="<addr-spec>">\\n<body>\\n</cross-session-message>
@@ -70,9 +70,9 @@ process does not have, and would turn a missing receiver setting into a
 silent success instead of the `held` outcome that says the sandbox is
 misconfigured.
 
-Wire: NDJSON per NOT-FOR-PUBLICATION/uds_findings.md §2 — an auth frame carrying the peerToken
+Wire: NDJSON — an auth frame carrying the peerToken
 from the key file, then ONE user frame with a msg_id and a `from`. RECEIPTS
-ARE OUT OF BAND (NOT-FOR-PUBLICATION/uds_findings.md §8; measured again on 2.1.263, 2026-09-07):
+ARE OUT OF BAND (measured again on 2.1.263, 2026-09-07):
 the receiver CONNECTS OUTWARD to the socket named in `from` and writes
 peer_message_status frames there. Nothing ever comes back on the inbound
 connection — under `refuse` it simply stalls open. So this daemon binds a
@@ -906,15 +906,21 @@ class Daemon:
     # -- main -----------------------------------------------------------------
 
     def run(self) -> int:
-        self.take_claims()
-        self.heartbeat()
-        hb = threading.Thread(target=self.heartbeat_loop, daemon=True)
-        hb.start()
-
+        # HANDLERS FIRST, BEFORE ANY CLAIM IS TAKEN. Between taking the claims
+        # and installing these, SIGTERM carries its default disposition: the
+        # process dies without unwinding, the `finally` below never runs, and
+        # both claim files are left behind holding an interlock nothing
+        # released. The window is small enough that a fast machine never sees
+        # it and a contended CI runner does.
         def on_term(signum, frame):
             self.stop.set()
         signal.signal(signal.SIGTERM, on_term)
         signal.signal(signal.SIGINT, on_term)
+
+        self.take_claims()
+        self.heartbeat()
+        hb = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        hb.start()
 
         log(f"started pid {os.getpid()}; mail={self.cfg.mail_notice_dir} peer={self.cfg.peer_notice_dir}")
         try:

@@ -1,8 +1,7 @@
 """tests/test_peer_notice_schema.py — the documents our tests write validate
 against the spec's own schema, using the spec's own validator.
 
-`NOT-FOR-PUBLICATION/delivery_design.md` §9: "the daemon validates against the schema when it
-exists." It exists as of 2026-09-03 — drafted in the working tree of
+The daemon validates against the schema when it exists. It exists as of 2026-09-03 — drafted in the working tree of
 `agent-mailbox-protocol/` (a sibling checkout), not yet on `main`. So this
 test loads that repo's `fixtures/validate.py` BY PATH and runs its
 `check_document` over the exact notice documents `test_inbox_delivery.py`
