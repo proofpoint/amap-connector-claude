@@ -1,0 +1,132 @@
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: suite (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The full range pyproject declares (requires-python = ">=3.9").
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Three of the four tools have no .py suffix, so an extension-driven
+      # linter never opens them. Parse all four by name instead.
+      - name: The tools parse
+        run: |
+          for f in bin/inbox-mcp-vol bin/inbox-submit bin/inbox-delivery bin/_inboxlib.py; do
+            python -c "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1])" "$f"
+            echo "  parsed $f"
+          done
+
+      # Stdlib only, by design: no install step, no requirements file.
+      # If this ever needs a `pip install`, the zero-dependency claim is gone.
+      - name: Suite
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee suite.log
+
+      # A SKIPPED VALIDATION IS NOT A PASSED ONE.
+      #
+      # tests/test_peer_notice_schema.py validates the documents this suite
+      # writes against the spec's own validator, loaded from a sibling
+      # `amap-spec` checkout. CI has no such checkout, so those proofs skip and
+      # this run says NOTHING about schema conformance.
+      #
+      # The count is pinned so a NEW skip cannot hide inside the same green
+      # tick. If you add a legitimately-skipped test, change these numbers
+      # deliberately -- that is the point.
+      #
+      # To make the proofs actually run: check out amap-spec beside this repo
+      # (or set $AMAP_SPEC_REPO at it) and set AMAP_REQUIRE_SPEC=1, which turns
+      # the skip into a hard failure. Do not set it without the checkout.
+      - name: The skips are the expected ones, and only those
+        run: |
+          set +e
+          skipped=$(grep -c '\.\.\. skipped' suite.log)
+          spec=$(grep -c 'no spec checkout found' suite.log)
+          gate=$(grep -c 'AMAP_REQUIRE_SPEC is not set' suite.log)
+          echo "skipped=$skipped  schema-proofs=$spec  release-gate=$gate"
+          if [ "$skipped" -ne 8 ] || [ "$spec" -ne 7 ] || [ "$gate" -ne 1 ]; then
+            echo "::error::expected exactly 8 skips (7 schema proofs + 1 release gate); got $skipped ($spec + $gate). A changed skip count is a coverage change, not a detail."
+            exit 1
+          fi
+          echo "::warning::The 7 schema proofs did NOT run -- no amap-spec checkout is available in CI. A green run here does not pin the schema."
+          exit 0
+
+      # Two documented invariants, both cheap to break and silent when broken:
+      #   * config fails loud -- one line to stderr naming the missing var,
+      #     nonzero exit, never a guessed path;
+      #   * stdout is protocol -- the MCP servers keep stdout JSON-RPC-pure
+      #     under EVERY error condition, including this one. A stray print()
+      #     is wire corruption, not a log line.
+      - name: Config fails loud, and stdout stays clean
+        run: |
+          set +e
+          fail=0
+          check () {
+            tool="$1"; shift
+            out=$(env -u INBOX_MESSAGE_DIR -u OUTBOX_DIR -u MAILBOX_ROOT_DIR -u INBOX_LANE \
+                  python "bin/$tool" "$@" 2>stderr.txt </dev/null)
+            rc=$?
+            lines=$(wc -l < stderr.txt | tr -d ' ')
+            echo "  $tool: exit=$rc stdout=${#out}B stderr_lines=$lines"
+            if [ "$rc" -eq 0 ] || [ -n "$out" ] || [ "$lines" -ne 1 ]; then
+              echo "::error::$tool broke the fail-loud / stdout-pure contract (want: nonzero exit, empty stdout, one stderr line)"
+              sed 's/^/      /' stderr.txt
+              fail=1
+            fi
+          }
+          check inbox-mcp-vol
+          check inbox-submit mcp
+          check inbox-delivery
+          exit $fail
+
+  install:
+    # Separate job: a packaging break must not be mistaken for a suite break.
+    # `pip install .` is optional by design -- the tools run straight off bin/
+    # from a checkout -- but README documents it, so it is tested.
+    name: pip install .
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install, and confirm the scripts land verbatim
+        run: |
+          python -m pip install --quiet .
+          for t in inbox-mcp-vol inbox-submit inbox-delivery; do
+            p=$(command -v "$t") || { echo "::error::$t was not installed"; exit 1; }
+            echo "  installed: $p"
+            # setuptools rewrites line 1 (the shebang) to the target
+            # interpreter -- expected. Everything below it must be the file
+            # from bin/: script-files copies the script, it does not generate
+            # a console-script wrapper around an importable package.
+            if ! diff -q <(tail -n +2 "$p") <(tail -n +2 "bin/$t") >/dev/null; then
+              echo "::error::$t differs from bin/$t below the shebang; script-files must copy the script itself"
+              exit 1
+            fi
+          done
+          echo "  all three copied unchanged below the shebang"
