@@ -49,7 +49,7 @@ Code expands `${VAR}` in both `command` and `env` before spawning the server,
 and does *not* expand `~`: a `command` of `~/…/inbox-mcp-vol` is spawned
 literally and fails ENOENT. `command` is resolved by the host before this code
 runs, so the expansion above can never help there — it applies to `env` values
-only. (Measured on a live sandbox, 2026-09-17, by the sandy adapter: the
+only. (Measured on a live sandbox, 2026-09-17: the
 `${HOME}` registration connected, the `~` twin did not.)
 
 The tool-side expansion is therefore belt-and-braces under Claude Code, and
@@ -72,8 +72,8 @@ unscanned on both.
 `inbox-delivery` is configured differently and deliberately so: eight explicit
 `AMAP_DELIVERY_*` variables, every one required, no root variable to derive
 from — it owns two spools and two claims, and a missing variable must fail
-loud. Its module docstring lists them; under sandy the adapter's `relay.sh`
-derives them from sandy's own exports.
+loud. Its module docstring lists them; a host deployment derives them from its
+own environment.
 
 One more is optional: `AMAP_DELIVERY_SELF`, this agent's own address, used for
 the mail doorbell's from-name and the peer lane's `to == self` integrity
@@ -108,8 +108,7 @@ set each tool's explicit variable (`INBOX_MESSAGE_DIR`, `OUTBOX_DIR`) when the
 volume is not laid out as `<root>/messages` + `<root>/dropbox`, which is the only
 shape `MAILBOX_ROOT_DIR` can derive. Nothing in `.mcp.json` pushes: a new notice
 reaches the live session through `bin/inbox-delivery`, which the host runs
-beside the session (under sandy, from its read-only relay slot, installed by
-`amap-adapter-sandy`).
+beside the session.
 
 `inbox-submit` is now an MCP server too (ccc-v0.2): `inbox-submit mcp`
 (registered above alongside `inbox`) exposes exactly two
