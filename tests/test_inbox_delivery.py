@@ -266,9 +266,9 @@ class Lab:
         self.readonly = []
 
     def set_claude_rows(self, n: int):
-        # TAB-separated, as the real sandy-handoff-sessions emits (verified
-        # 2026-09-10 in a live sandbox; sandy's own harnesses parse it with
-        # awk -F'\t'). The fixture used spaces and so never exercised the
+        # TAB-separated, as the real session-source command emits (verified
+        # 2026-09-10 in a live sandbox, where the host's own harnesses parse it
+        # with awk -F'\t'). The fixture used spaces and so never exercised the
         # format that ships — a parser matching on "claude " passed here and
         # found nothing in production.
         rows = ["\t".join(["claude", str(i), str(100+i), str(200+i), str(self.sock), str(self.key)])

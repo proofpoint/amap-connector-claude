@@ -24,8 +24,8 @@ path every connector actually hits: every write, rename, or mkdir attempt
 under the frozen directory raises `OSError`.
 
 Self-contained, stdlib-only, unittest-compatible (also pytest-collectible).
-Does not import sandy's harness (outside this unit's writable paths, and a
-different deployment's scaffolding) — a small local JSON-RPC stdio helper is
+Does not import any host's test harness (outside this unit's writable paths,
+and a deployment's scaffolding, not the connector's) — a small local JSON-RPC stdio helper is
 enough for the request/notify/initialize shapes these binaries speak.
 """
 
@@ -59,7 +59,7 @@ def _bin(name: str) -> Path:
 class _McpProc:
     """One connector binary, run as a child process and driven as a
     newline-delimited JSON-RPC 2.0 stdio server. Trimmed local equivalent of
-    sandy/tests/harness.py's McpProcess — request/notify/wait_notification/
+    a host harness's MCP process driver — request/notify/wait_notification/
     initialize only, nothing router-specific."""
 
     def __init__(self, bin_name: str, env: dict, extra_args=None, cwd=None):

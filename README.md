@@ -89,7 +89,7 @@ which defaulted to `<repo>/.amp/...` relative to their own file location —
 a default that only made sense symlinked inside inbox-lab, and silently
 pointed at the wrong (or an empty) spool once extracted.
 
-## Registering with Claude Code / sandy
+## Registering with Claude Code
 
 **[`.mcp.json.example`](.mcp.json.example)** registers all three MCP servers —
 `inbox` and `delegation` (the same binary on different lanes) and

@@ -42,9 +42,9 @@ the read-only peer tree is the router's signature on it (ruling 16). Nothing
 here is an allowlist, and there is no longer a file that could be mistaken
 for one.
 
-This daemon knows no sandy variable and derives nothing from one. The wrapper
-that launches it under sandy does that translation (ruling 15); the former
-SANDY_HANDOFF_* cross-check compared values against their own source.
+This daemon knows no host variable and derives nothing from one. The host's
+wrapper does that translation (ruling 15); a former cross-check against the
+host's own variables compared values against their own source.
 
 Claims: both are taken first, with the primitive in bin/_inboxlib.py, and
 EITHER being held is a nonzero exit naming the holder. For a daemon there is
@@ -53,8 +53,8 @@ no "continue without the interlock".
 Targeting — refuse, don't guess: run AMAP_DELIVERY_SESSION_SOURCE and count the
 rows whose agent is "claude". Exactly one -> inject via its socket and key
 file. Several -> outcome "ambiguous_target", the notice stays in the spool.
-None -> wait and re-poll; sandy no longer starts the relay under --remote, so
-"no panes ever" needs no special case.
+None -> wait and re-poll. "No panes ever" is not special-cased: not running
+this daemon where no session can exist is the host's job.
 
 The envelope — this daemon OWNS it. Claude Code parses the sender's identity
 and class claim out of the CONTENT STRING with an anchored regex, measured
