@@ -415,6 +415,10 @@ def reply_trailer(sender: str, msg_id) -> str:
     safe. The cost is that a sender could write an imitation trailer in its own
     body; that misleads no further than a wrong in_reply_to, because where a
     reply is delivered is the runtime's decision, not this text's."""
+    # CROSS-REPO CONTRACT: "-- added by inbox-delivery --" and "message id:" are
+    # matched by a deployment's agent policy and pinned in its CI. Renaming either
+    # breaks replies on hosts that have not updated; change them only together
+    # with the deployments that read them.
     lines = ["", "-- added by inbox-delivery --"]
     if isinstance(msg_id, str) and MSG_ID_RE.match(msg_id):
         lines.append(f"message id: {msg_id}")
