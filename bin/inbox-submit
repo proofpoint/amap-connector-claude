@@ -77,6 +77,17 @@ DROPBOX_DIR_ENV = "OUTBOX_DIR"
 MAILBOX_ROOT_DIR_ENV = "MAILBOX_ROOT_DIR"
 AGENT_ID_ENV = "MAILBOX_AGENT_ID"
 
+# The fleet roster, read by the `peers` tool only. Both variables are optional
+# for the SERVER — `submit` never needs them — so neither is checked at startup;
+# `peers` reports their absence itself, naming the variable.
+ROSTER_DIR_ENV = "AMAP_ROSTER_DIR"     # directory holding roster.json (read-only mount)
+SELF_ENV = "AMAP_SELF"                 # this agent's own address, used ONLY to flag it
+ROSTER_FILE = "roster.json"
+ROSTER_CONTRACT_MAJOR = "2"            # roster.schema.json pins contract_version const "2"
+_ROSTER_MAX_BYTES = 4 * 1024 * 1024
+# One bare addr-spec, the roster schema's own member pattern.
+_ADDR_RE = re.compile(r"\A[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+@[A-Za-z0-9.-]+\Z")
+
 # --- attachment carriage constants (attachments-outbound-v0.1) --------------
 ATTACH_MAX_ENV = "INBOX_ATTACH_MAX_BYTES"        # per-file courtesy cap override
 ATTACH_MAX_BYTES_DEFAULT = 25 * 1024 * 1024      # 25 MiB
@@ -479,9 +490,11 @@ MCP_INSTRUCTIONS = (
     "allowlist/policy against, and may hold it for a human to approve "
     "(queued_for_human) or reject it. The message is NOT 'sent' until "
     "submit_result reports outcome 'accepted' — call it with the req_id "
-    "`submit` returns to check status. There is no read tool here by "
+    "`submit` returns to check status. There is no MAIL read tool here by "
     "design: reading inbound mail goes through the inbox-mcp-vol server, "
-    "never this one. `submit` also accepts an `attachments` list (local "
+    "never this one. The one read tool here, `peers`, looks up addresses in "
+    "the fleet roster before you submit — a directory, not an allowlist. "
+    "`submit` also accepts an `attachments` list (local "
     "file paths) — the bytes are carried into the drop-box and the relay "
     "decides the outcome. On the peer lane, attachment-bearing requests "
     "have been observed to be accepted and delivered with NO human step. "
@@ -574,6 +587,37 @@ MCP_TOOLS = [
                 "req_id": {"type": "string", "description": "req_id returned by submit"},
             },
             "required": ["req_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "peers",
+        "description": (
+            "Look up peer addresses in the fleet roster ($AMAP_ROSTER_DIR/"
+            "roster.json, written by the runtime). A DIRECTORY, NOT AN "
+            "ALLOWLIST: being listed means the instance exists, never that you "
+            "may address it or that a submission to it will be accepted — the "
+            "runtime decides at submit time and only submit_result reports what "
+            "happened. `query` matches the local part of each address, "
+            "case-insensitively: an exact address or local part wins, else a "
+            "prefix, else a substring; empty returns everyone. If `ambiguous` is "
+            "true, more than one member matched: ask your user which one they "
+            "mean — never pick. Freshness is reported, not judged: `written_at`, "
+            "`interval_s` (null when the runtime did not state one) and `age_s` "
+            "by this machine's clock; decide staleness yourself. `state` is "
+            "passed through as written — treat values you do not recognise as "
+            "opaque. The roster never tells you who you are; a member equal to "
+            "$AMAP_SELF, when that is set, carries self: true. A missing roster "
+            "is an error, never an empty list: absent means unknown."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "name or address to look up; empty lists every member",
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -729,9 +773,124 @@ def tool_submit_result(args: dict) -> dict:
     return text_content("\n".join(lines))
 
 
+def _roster_age_s(written_at):
+    """Seconds since the roster's `written_at`, by THIS machine's clock, or None
+    when it does not parse. Reported, never judged: the publishing runtime's
+    clock and this one need not agree, so a small or negative age is possible
+    and is passed through as measured."""
+    if not isinstance(written_at, str):
+        return None
+    text = written_at.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"   # fromisoformat accepts "Z" only from 3.11
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        return None                   # RFC 3339 carries an offset; without one, unknown
+    now = datetime.now(timezone.utc)
+    return round((now - stamp).total_seconds(), 1)
+
+
+def _match_members(members: list, query: str):
+    """(matches, ambiguous). An exact address or exact local part wins outright;
+    otherwise a local-part prefix; otherwise a local-part substring. Case-
+    insensitive. More than one match is AMBIGUOUS — never narrowed by guessing."""
+    if not query:
+        return members, False
+    q = query.lower()
+
+    def local(m):
+        return m["address"].split("@", 1)[0].lower()
+
+    for tier in (
+        [m for m in members if m["address"].lower() == q or local(m) == q],
+        [m for m in members if local(m).startswith(q)],
+        [m for m in members if q in local(m)],
+    ):
+        if tier:
+            return tier, len(tier) > 1
+    return [], False
+
+
+def tool_peers(args: dict) -> dict:
+    query = args.get("query", "")
+    if not isinstance(query, str):
+        return error_content("peers: 'query' must be a string")
+    query = query.strip()
+
+    raw_dir = os.environ.get(ROSTER_DIR_ENV)
+    if not raw_dir:
+        return error_content(
+            f"peers: ${ROSTER_DIR_ENV} is not set, so the roster's location is "
+            "unknown. That is NOT an empty fleet — it means this deployment has "
+            "not exposed a roster here.")
+    path = Path(expand_path(raw_dir)) / ROSTER_FILE
+
+    self_addr = os.environ.get(SELF_ENV)
+    if self_addr is not None and not _ADDR_RE.match(self_addr):
+        return error_content(
+            f"peers: ${SELF_ENV} is set but is not a bare address ({self_addr[:80]!r})")
+
+    try:
+        if path.stat().st_size > _ROSTER_MAX_BYTES:
+            return error_content(f"peers: roster at {path} is larger than {_ROSTER_MAX_BYTES} bytes")
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return error_content(
+            f"peers: no roster at {path} (from ${ROSTER_DIR_ENV}). Absent means "
+            "UNKNOWN, never an empty fleet.")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return error_content(f"peers: cannot read roster at {path}: {e}")
+    if not isinstance(doc, dict):
+        return error_content(f"peers: roster at {path} is not a JSON object")
+
+    # Version FIRST, before reading anything else (contract §7 ordering): an
+    # absent, lower or higher major is a refusal, not a best-effort parse.
+    cv = doc.get("contract_version")
+    if not isinstance(cv, str) or cv.split(".")[0] != ROSTER_CONTRACT_MAJOR:
+        return error_content(
+            f"peers: roster contract_version is {cv!r}; this connector reads major "
+            f"{ROSTER_CONTRACT_MAJOR!r} only. Refusing rather than guessing at its shape.")
+
+    raw_members = doc.get("members")
+    if not isinstance(raw_members, list):
+        return error_content(f"peers: roster at {path} has no members list")
+    members, skipped = [], 0
+    for m in raw_members:
+        addr = m.get("address") if isinstance(m, dict) else None
+        if not isinstance(addr, str) or not _ADDR_RE.match(addr):
+            skipped += 1
+            continue
+        state = m.get("state")
+        # OPEN vocabulary: pass any string through untouched, never filter on it.
+        entry = {"address": addr, "state": state if isinstance(state, str) else None}
+        if self_addr is not None and addr.lower() == self_addr.lower():
+            entry["self"] = True
+        members.append(entry)
+
+    matches, ambiguous = _match_members(members, query)
+    interval_s = doc.get("interval_s")
+    out = {
+        "query": query,
+        "members": matches,
+        "ambiguous": ambiguous,
+        "written_at": doc.get("written_at"),
+        # Absent stays absent: the runtime did not state an interval, so none is invented.
+        "interval_s": interval_s if isinstance(interval_s, (int, float))
+                      and not isinstance(interval_s, bool) else None,
+        "age_s": _roster_age_s(doc.get("written_at")),
+    }
+    if skipped:
+        out["skipped_entries"] = skipped
+    return text_content(json.dumps(out, indent=2))
+
+
 MCP_DISPATCH = {
     "submit": tool_submit,
     "submit_result": tool_submit_result,
+    "peers": tool_peers,
 }
 
 

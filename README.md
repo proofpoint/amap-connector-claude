@@ -116,8 +116,32 @@ tools, `submit` and `submit_result` — `submit` writes the same inert
 drop-box request the CLI does and returns `{req_id, status: "queued"}`; it
 is a **GATED request, not a send** — the host-side relay applies the
 recipient allowlist and may hold it (`queued_for_human`); nothing is "sent"
-until `submit_result` reports outcome `accepted`. There is no read tool and
-no direct-send path on this server; it makes no network calls itself.
+until `submit_result` reports outcome `accepted`. There is no mail read tool
+and no direct-send path on this server; it makes no network calls itself.
+
+A third tool, **`peers(query)`**, resolves a name to an address before you
+submit, by reading the runtime's fleet roster (`roster.json`,
+`roster.schema.json`). It is a **directory, not an allowlist**: a member's
+presence says the instance exists, never that a submission to it will be
+accepted.
+
+- `query` matches the local part case-insensitively — an exact address or local
+  part first, then a prefix, then a substring. More than one match returns all
+  of them with `ambiguous: true`, so the agent asks rather than picks.
+- Freshness is reported, not judged: `written_at`, `interval_s` (null when the
+  runtime gave none) and `age_s`. Apply your deployment's staleness rule to
+  those; the connector applies none.
+- `state` is passed through as written; the vocabulary is open.
+- A missing roster is an error, never an empty list.
+
+It reads two variables, both optional for the server as a whole — `submit`
+needs neither, and `peers` reports their absence itself:
+
+- `AMAP_ROSTER_DIR` — the directory holding `roster.json`, normally a read-only
+  mount.
+- `AMAP_SELF` — this agent's own address. Used only to mark that member
+  `self: true`; the roster is not a source of the reader's identity, so without
+  it nothing is marked.
 
 The CLI front-end is unchanged and still there for host scripting /
 host-side scripting — invoke it directly:

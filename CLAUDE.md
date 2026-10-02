@@ -54,7 +54,7 @@ python3 -m unittest discover -s tests -q
 
 Stdlib only — there is **no pytest dependency**. The suite is `unittest.TestCase`
 throughout (pytest can collect it if you have it, but nothing here needs it, and
-a bare checkout has no pytest). Verified at HEAD: **103 tests, `OK (skipped=8)`,
+a bare checkout has no pytest). Verified at HEAD: **123 tests, `OK (skipped=8)`,
 ~40 s** in a checkout with no sibling `amap-spec` (the eight skips are the schema
 proofs plus their gate — see below; do not set `AMAP_REQUIRE_SPEC` unless a spec
 checkout is present, or those skips become a failure). The suite is slow for its
