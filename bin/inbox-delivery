@@ -395,6 +395,39 @@ def sanitize_attr(value: str, limit: int = 200) -> str:
     return s[:limit]
 
 
+# A message id goes into the reply trailer verbatim, so it is echoed only when
+# it is a bare token. The spec mints it under the notice_id charset; anything
+# else -- whitespace, quotes, newlines -- is withheld rather than quoted.
+MSG_ID_RE = re.compile(r"\A[A-Za-z0-9._-]{1,200}\Z")
+
+
+def reply_trailer(sender: str, msg_id) -> str:
+    """The daemon's own lines after a delegation's body, INSIDE the envelope.
+
+    A delegation arrives as a cross-session message, and the harness's note on
+    such messages says to answer with SendMessage -- which reaches local
+    sessions, never a peer ADDRESS. An agent that follows it fails, and one
+    that cannot see the message id cannot thread a reply even when it picks the
+    right tool. So this says both, where the agent decides how to respond.
+
+    Inside the envelope, not after it: the receiver parses the content string
+    with an anchored regex, and text past the closing tag is not measured to be
+    safe. The cost is that a sender could write an imitation trailer in its own
+    body; that misleads no further than a wrong in_reply_to, because where a
+    reply is delivered is the runtime's decision, not this text's."""
+    lines = ["", "-- added by inbox-delivery --"]
+    if isinstance(msg_id, str) and MSG_ID_RE.match(msg_id):
+        lines.append(f"message id: {msg_id}")
+        ref = f'in_reply_to="{msg_id}"'
+    else:
+        lines.append("message id: not available (withheld: not a bare token)")
+        ref = "in_reply_to set to this message's id, read via the delegation read tool"
+    lines.append(
+        f'To reply: inbox-submit\'s submit, with to=["{sender}"] and {ref}. '
+        "SendMessage cannot reach this address.")
+    return "\n".join(lines)
+
+
 def envelope(from_name: str, body: str) -> str:
     """The daemon's OWN envelope around every injected body — see the module
     docstring. Never from-mode."""
@@ -818,7 +851,7 @@ class Daemon:
                         f"{k}={sanitize_attr(str(a.get(k, '')), 120)!r}"
                         for k in ("filename", "media_type", "size_bytes", "disposition")))
             body += "\n\nattachments (descriptors only; bytes via read_attachment):\n" + "\n".join(lines)
-        return frm, body
+        return frm, body + "\n" + reply_trailer(frm, msg.get("id"))
 
     def _refuse(self, notice_id: str, why: str) -> None:
         log(f"peer notice {notice_id}: refused — {why}")

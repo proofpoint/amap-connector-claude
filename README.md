@@ -158,7 +158,11 @@ the mail tree (`inbound/notices`) and the peer tree (`peer/notices`, the AMAP
 session over the session's own Unix-socket messaging: a **content-free
 doorbell** for mail (the agent then reads with `read_message`), the **peer's
 request itself** for delegation, framed as untrusted content with the
-runtime-asserted sender. It takes a consumer claim on both spools before
+runtime-asserted sender. A delegation ends with a short trailer the daemon adds
+inside the envelope: the message id, and that a reply goes through
+`inbox-submit`'s `submit` with that id as `in_reply_to` — the harness's own
+note on cross-session messages points at SendMessage, which cannot reach a peer
+address. It takes a consumer claim on both spools before
 watching and exits nonzero if either is held; keeps its delivered ledger
 where no router can write; writes a per-notice outcome file
 (`outbound/ext/claude-code/outcomes/`) the router reads as a
