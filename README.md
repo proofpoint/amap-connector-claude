@@ -180,8 +180,14 @@ behave; the daemon cannot enforce most of them, so a deployment has to.
   holds every delegation for approval, because the daemon asserts no permission
   class. Use the `--settings` value the session is launched with, or managed
   settings; a user settings file is usually writable by the agent it governs.
+  Claude Code's documentation names the holding value `hold` on one page and
+  `notice` on another; measured on 2.1.278, both are accepted and both hold.
 - **No `--bare` session.** Bare mode binds no inbox socket, so there is nothing
   to deliver to.
+- **A long-lived session, not a `claude -p` worker.** A `-p` session answers its
+  one prompt and takes no further turns, so a delegation that arrives after its
+  last turn is accepted without any receipt and never reaches the model. This
+  daemon records that silence as `delivered`.
 - **The daemon must not run inside the session's process tree.** Claude Code
   treats a message from one of a session's own child processes as the
   session's own and delivers it even where outside input would be held; on
@@ -209,11 +215,15 @@ behave; the daemon cannot enforce most of them, so a deployment has to.
   as `delivered`, so a hold or refusal would read as success. Test a refusing
   receiver once after deploying.
 
-Two receiver limits are worth knowing because their drops are not reported to
-this side: a session queues at most 50 accepted messages and drops identical
-repeats arriving close together. The daemon keeps at most 8 injections in
-flight at once; a default (permission-mode) hold is dropped after the
-receiver's `dialogExpiry`, five minutes unless configured.
+Receiver limits, as measured on Claude Code 2.1.278: a session queues at most 50
+accepted messages, and each one past that comes back as a `dropped` receipt,
+which this daemon retries with backoff. It keeps at most 8 injections in flight,
+well under that limit. Two identical messages sent a few milliseconds apart both
+reached the receiving model, so repeat suppression did not drop them. Whether
+per-sender rate limiting can drop a message without a receipt is not yet
+measured. A default (permission-mode) hold is dropped after the receiver's
+`dialogExpiry`; the cross-session documentation gives five minutes and the
+settings reference ten, so do not rely on either.
 
 ### Inbound attachments (amap-spec v2.3.0 §5)
 
