@@ -195,10 +195,14 @@ behave; the daemon cannot enforce most of them, so a deployment has to.
   `claude <pane_index> <pane_pid> <session_pid> <socket> <keyfile>`. Fields 1–2
   are not read, so `-` is fine where there are no panes; `<session_pid>` feeds
   the ancestry check, and a non-numeric value means the check is skipped and
-  logged. Paths must not contain whitespace. Take the socket path from the
-  session itself (`CLAUDE_CODE_MESSAGING_SOCKET`, or `/status`'s `Peer address`)
-  rather than reconstructing it: Claude Code falls back to a private
-  `/tmp/cc-socks-<uid>` directory when it cannot use the default.
+  logged. Paths must not contain whitespace. Look for the session's socket in
+  both places Claude Code may put it, `/tmp/cc-socks/<pid>.sock` and the
+  private fallback `/tmp/cc-socks-<uid>/<pid>.sock`, which it uses when it
+  cannot accept the default directory. A lister that checks only the first
+  finds nothing in that case, and delivery stops without an error. Claude Code
+  exports the path as `CLAUDE_CODE_MESSAGING_SOCKET` only to its child
+  processes, not into its own environment, so a lister inspecting the session
+  from outside cannot read it there.
 - **A writable socket directory.** The daemon binds its receipt socket beside the
   session's socket. If it cannot, or the session does not recognise the
   directory, no receipt ever arrives — and silence within the window is recorded
