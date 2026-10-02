@@ -170,6 +170,47 @@ claim, never as proof; refuses when it cannot identify a single target
 session; and holds no allowlist — authorisation on the peer lane is the
 router's, evidenced by the read-only mount.
 
+### What the host must provide
+
+These follow from how Claude Code's cross-session messaging is documented to
+behave; the daemon cannot enforce most of them, so a deployment has to.
+
+- **`crossSessionInbound` set to `accept` in the receiving session, somewhere the
+  agent cannot write.** Without it a session running with `bypassPermissions`
+  holds every delegation for approval, because the daemon asserts no permission
+  class. Use the `--settings` value the session is launched with, or managed
+  settings; a user settings file is usually writable by the agent it governs.
+- **No `--bare` session.** Bare mode binds no inbox socket, so there is nothing
+  to deliver to.
+- **The daemon must not run inside the session's process tree.** Claude Code
+  treats a message from one of a session's own child processes as the
+  session's own and delivers it even where outside input would be held; on
+  Linux it decides that by process ancestry. Run `inbox-delivery` beside the
+  session, never under it. The daemon refuses any target whose pid is one of its
+  live ancestors (outcome `inject_failed`), but it cannot see a parent that has
+  already exited, so starting it under the session and letting it be reparented
+  is not safe either.
+- **A session source that reports what the session actually uses.** One row per
+  live session, whitespace-separated:
+  `claude <pane_index> <pane_pid> <session_pid> <socket> <keyfile>`. Fields 1–2
+  are not read, so `-` is fine where there are no panes; `<session_pid>` feeds
+  the ancestry check, and a non-numeric value means the check is skipped and
+  logged. Paths must not contain whitespace. Take the socket path from the
+  session itself (`CLAUDE_CODE_MESSAGING_SOCKET`, or `/status`'s `Peer address`)
+  rather than reconstructing it: Claude Code falls back to a private
+  `/tmp/cc-socks-<uid>` directory when it cannot use the default.
+- **A writable socket directory.** The daemon binds its receipt socket beside the
+  session's socket. If it cannot, or the session does not recognise the
+  directory, no receipt ever arrives — and silence within the window is recorded
+  as `delivered`, so a hold or refusal would read as success. Test a refusing
+  receiver once after deploying.
+
+Two receiver limits are worth knowing because their drops are not reported to
+this side: a session queues at most 50 accepted messages and drops identical
+repeats arriving close together. The daemon keeps at most 8 injections in
+flight at once; a default (permission-mode) hold is dropped after the
+receiver's `dialogExpiry`, five minutes unless configured.
+
 ### Inbound attachments (amap-spec v2.3.0 §5)
 
 `inbox-mcp-vol` exposes attachment descriptors on every `read_message`

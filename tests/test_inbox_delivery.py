@@ -265,13 +265,19 @@ class Lab:
         self.proc = None
         self.readonly = []
 
-    def set_claude_rows(self, n: int):
+    def set_claude_rows(self, n: int, *, pane=None, agent_pid=None):
         # TAB-separated, as the real session-source command emits (verified
         # 2026-09-10 in a live sandbox, where the host's own harnesses parse it
         # with awk -F'\t'). The fixture used spaces and so never exercised the
         # format that ships — a parser matching on "claude " passed here and
         # found nothing in production.
-        rows = ["\t".join(["claude", str(i), str(100+i), str(200+i), str(self.sock), str(self.key)])
+        # `pane="-"` writes the placeholder a host with no panes uses; `agent_pid`
+        # overrides the session-pid column, which the ancestry guard reads.
+        rows = ["\t".join(["claude",
+                           "-" if pane == "-" else str(i),
+                           "-" if pane == "-" else str(100+i),
+                           str(200+i) if agent_pid is None else str(agent_pid),
+                           str(self.sock), str(self.key)])
                 for i in range(n)]
         rows.append("\t".join(["codex", "9", "999", "998",
                                f"{self.sockdir}/x.sock", f"{self.sockdir}/x.key"]))
@@ -499,6 +505,7 @@ class WireTest(DeliveryTestCase):
         # even for holds no approval can release (measured 2026-09-10).
         det = lab.outcome()["detail"]
         self.assertIn("permission-mode parity", det, "the receiver's own words are quoted")
+        self.assertIn("dialogExpiry", det, "a default hold expires, and the operator is told so")
         self.assertIn("no hold cause", det, "the daemon must not claim to know the cause")
         self.assertNotIn("parked it for a human's approval", det)
         # The router read and unlinked the held outcome. The daemon must not care.
@@ -740,6 +747,58 @@ class PeerLaneTest(DeliveryTestCase):
 
 
 # --- the mail lane ----------------------------------------------------------
+
+class AncestryAndLoadTest(DeliveryTestCase):
+    """Two limits the documented receiver imposes, enforced on this side.
+
+    A message from one of a session's own child processes is the session's
+    own, and on Linux Claude Code decides that by ancestry. The harness starts
+    the daemon as a direct child of THIS test process, so naming this process's
+    pid as the session is a real ancestry case, not a simulated one.
+    """
+
+    def test_a_session_this_daemon_descends_from_is_never_delivered_to(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, agent_pid=os.getpid())
+        lab.start()
+        self.assertTrue(lab.wait_outcome("inject_failed"), lab.stderr())
+        self.assertIn("ancestor", lab.outcome()["detail"])
+        time.sleep(1.0)
+        self.assertEqual(lab.receiver.connections, 0, "nothing may be sent to an ancestor")
+        self.assertFalse(lab.ledgered())
+
+    def test_dash_pane_fields_and_a_foreign_session_pid_deliver(self):
+        """The row a host with no panes writes. Pins that fields 1-2 are not read."""
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, pane="-", agent_pid=424242)
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+
+    def test_a_non_numeric_session_pid_delivers_and_says_it_could_not_check(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, pane="-", agent_pid="-")
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+        self.assertIn("cannot check", lab.stderr())
+
+    def test_injections_in_flight_are_capped(self):
+        """The receiver queues at most 50 and drops past that, silently from here.
+        The daemon keeps its own concurrency at 8 (MAX_IN_FLIGHT)."""
+        lab = self.lab()
+        ids = [f"{i:032x}" for i in range(1, 13)]
+        for nid in ids:
+            lab.peer_notice(notice_id=nid)
+        lab.start(AMAP_DELIVERY_RECEIPT_WINDOW_SECONDS="3")
+        self.assertTrue(lab.wait_for(lambda: lab.receiver.connections >= 1), lab.stderr())
+        time.sleep(1.0)
+        self.assertLessEqual(lab.receiver.connections, 8,
+                             "more than MAX_IN_FLIGHT injections were open at once")
+        self.assertTrue(lab.wait_for(lambda: all(lab.ledgered(n) for n in ids), timeout=30),
+                        "the rest must still be delivered on later polls")
+
 
 class MailLaneTest(DeliveryTestCase):
     def test_doorbell_is_content_free_and_writes_no_outcome(self):

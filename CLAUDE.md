@@ -54,7 +54,7 @@ python3 -m unittest discover -s tests -q
 
 Stdlib only — there is **no pytest dependency**. The suite is `unittest.TestCase`
 throughout (pytest can collect it if you have it, but nothing here needs it, and
-a bare checkout has no pytest). Verified at HEAD: **129 tests, `OK (skipped=8)`,
+a bare checkout has no pytest). Verified at HEAD: **133 tests, `OK (skipped=8)`,
 ~40 s** in a checkout with no sibling `amap-spec` (the eight skips are the schema
 proofs plus their gate — see below; do not set `AMAP_REQUIRE_SPEC` unless a spec
 checkout is present, or those skips become a failure). The suite is slow for its
@@ -201,6 +201,24 @@ envelope. **`from-mode` is NEVER set**: claiming `bypass` would assert a class
 this process does not have, and would turn a missing receiver setting into a
 silent success instead of the `held` outcome that says the sandbox is
 misconfigured.
+
+### Never a descendant of the session it delivers to
+
+Claude Code delivers a message from one of a session's **own child processes**
+whenever no `crossSessionInbound` value applies — including in a session that
+would hold outside input for approval — and on Linux it recognises its own
+children by process ancestry, whether or not they send a token. A delegation is
+another agent's words; arriving as the session's own would launder it past that
+hold. It is the same error as setting `from-mode`, reached by a different door.
+
+So the daemon refuses any target whose `session_pid` (field 3 of the
+session-source row) is one of its live ancestors, writing `inject_failed`. Two
+limits, both stated in the code: the check sees **live** ancestry only — a
+parent that has exited is invisible to it but not to Claude Code — and a
+non-numeric `session_pid` skips the check with a log line. Never "fix" a
+deployment by starting the daemon from a session hook: the guard would refuse
+it, and correctly. And never send `CLAUDE_CODE_MESSAGING_TOKEN`; that token is
+how a child proves it is the session's own.
 
 ### Silence is delivery, and is never retried
 

@@ -181,6 +181,11 @@ REPLY_SOCK_RE = re.compile(r"^(\d+(-[0-9a-f]{8})?|[0-9a-f]{1,16})\.sock$")
 HELD_WAIT_SECONDS = 3600.0          # how long a worker waits on a held receipt
 BACKOFF_FIRST, BACKOFF_MAX = 2.0, 300.0
 MAX_BODY_BYTES = 256 * 1024         # a body larger than this is refused, not truncated
+# Injections in flight at once. The receiving session queues at most 50 accepted
+# messages and drops past that, and a drop there is silent here -- which this
+# daemon would record as `delivered`. Staying well under it keeps a burst of
+# notices from becoming a burst of silent losses; the rest wait one poll.
+MAX_IN_FLIGHT = 8
 
 NOTICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 NOTICE_FILE_RE = re.compile(r"^notice-([a-f0-9]{32})\.json$")
@@ -441,11 +446,12 @@ def envelope(from_name: str, body: str) -> str:
 # --- targeting -------------------------------------------------------------------
 
 class Target:
-    __slots__ = ("socket_path", "key_file")
+    __slots__ = ("socket_path", "key_file", "agent_pid")
 
-    def __init__(self, socket_path: str, key_file: str):
+    def __init__(self, socket_path: str, key_file: str, agent_pid: Optional[int] = None):
         self.socket_path = socket_path
         self.key_file = key_file
+        self.agent_pid = agent_pid      # the session's own pid, when the row gives one
 
 
 def find_claude_targets(session_source: str) -> Optional[List[Target]]:
@@ -464,8 +470,31 @@ def find_claude_targets(session_source: str) -> Optional[List[Target]]:
     for line in p.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 6 and parts[0] == "claude":
-            targets.append(Target(parts[4], parts[5]))
+            # Fields 1-2 (pane index, pane pid) are never read, so a host with
+            # no panes may write "-" there. Field 3 is the session's pid, read
+            # for the ancestry guard only.
+            pid = int(parts[3]) if parts[3].isdigit() else None
+            targets.append(Target(parts[4], parts[5], pid))
     return targets
+
+
+def ancestor_pids() -> Optional[frozenset]:
+    """This process's live ancestors, from /proc, or None where /proc is not
+    available. Read once at startup: a process's ancestry only shrinks."""
+    out = set()
+    pid = os.getpid()
+    try:
+        while pid > 1:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as f:
+                ppid = next((int(l.split()[1]) for l in f if l.startswith("PPid:")), 0)
+            if ppid <= 0:
+                break
+            out.add(ppid)
+            pid = ppid
+    except (OSError, ValueError, StopIteration):
+        if not out:
+            return None
+    return frozenset(out)
 
 
 # --- the wire ----------------------------------------------------------------------
@@ -579,8 +608,10 @@ def _held_detail(reason: str) -> str:
     said = f' It says: "{reason[:160]}".' if reason else ""
     return ("held by the receiving sandbox." + said +
             " The wire carries no hold cause: a permission-mode hold is"
-            " human-approvable, a crossSessionInbound setting hold is not."
-            " Check that sandbox.")
+            " human-approvable and is DROPPED if nobody answers within the"
+            " receiver's dialogExpiry (5 minutes by default); a"
+            " crossSessionInbound `hold` setting does not expire and is"
+            " released only when `accept` applies. Check that sandbox.")
 
 
 def inject(target: Target, content: str, msg_id: str,
@@ -668,6 +699,8 @@ class Daemon:
         self.retry_at: Dict[Tuple[str, str], float] = {}
         self.backoff: Dict[Tuple[str, str], float] = {}
         self.lock = threading.Lock()
+        self.ancestors = ancestor_pids()
+        self._ancestry_logged: set = set()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -721,7 +754,39 @@ class Daemon:
                 self._outcome_once(tree, notice_id, "ambiguous_target",
                                    f"{len(targets)} live claude sessions; refusing to guess")
             return None
-        return targets[0]
+        target = targets[0]
+        # NEVER DELIVER TO A SESSION THIS DAEMON DESCENDS FROM. Claude Code
+        # treats a message from one of the session's own child processes as the
+        # session's own -- delivered whenever no crossSessionInbound value
+        # applies, even where the session would hold outside input for approval
+        # -- and on Linux it decides that by process ancestry, token or not. A
+        # delegation is another agent's words; arriving as the session's own
+        # would launder it past that hold, the same error as asserting a
+        # from-mode this process does not have. So refuse, and say why.
+        #
+        # This checks LIVE ancestry. Claude Code's evidence also covers children
+        # whose parent has since exited; a daemon that was started under the
+        # session and then reparented would pass this check and still be
+        # classed as the session's own. Hosts must not start it there at all.
+        pid = target.agent_pid
+        if pid is None or self.ancestors is None:
+            why = ("the session source gave no numeric session pid" if pid is None
+                   else "this platform has no /proc to read ancestry from")
+            if ("unverifiable", why) not in self._ancestry_logged:
+                self._ancestry_logged.add(("unverifiable", why))
+                log(f"cannot check that the target session is not this daemon's ancestor: {why}")
+            return target
+        if pid in self.ancestors:
+            detail = (f"target session pid {pid} is an ancestor of this daemon; a message "
+                      "from it would count as the session's own output, not a peer's. "
+                      "Start inbox-delivery outside the session's process tree.")
+            if pid not in self._ancestry_logged:
+                self._ancestry_logged.add(pid)
+                log(detail)
+            if tree == TREE_PEER:
+                self._outcome_once(tree, notice_id, "inject_failed", detail)
+            return None
+        return target
 
     def _outcome_once(self, tree: str, notice_id: str, outcome: str, detail: str = "") -> None:
         """Write an outcome when it is a TRANSITION for this notice. The router
@@ -741,6 +806,8 @@ class Daemon:
             key = (TREE_MAIL, notice_id)
             if self.ledger.has(TREE_MAIL, notice_id) or key in self.in_flight:
                 continue
+            if len(self.in_flight) >= MAX_IN_FLIGHT:
+                return                        # the rest wait for the next poll
             if not self._retry_due(key):
                 continue
             target = self.one_target(TREE_MAIL, notice_id)
@@ -758,6 +825,8 @@ class Daemon:
             key = (TREE_PEER, notice_id)
             if self.ledger.has(TREE_PEER, notice_id) or key in self.in_flight:
                 continue
+            if len(self.in_flight) >= MAX_IN_FLIGHT:
+                return                        # the rest wait for the next poll
             if not self._retry_due(key):
                 continue
             verdict = self._admit(notice_id, path)
