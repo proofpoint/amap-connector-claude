@@ -494,6 +494,12 @@ MCP_INSTRUCTIONS = (
     "design: reading inbound mail goes through the inbox-mcp-vol server, "
     "never this one. The one read tool here, `peers`, looks up addresses in "
     "the fleet roster before you submit — a directory, not an allowlist. "
+    "`submit` is ALSO HOW YOU ANSWER A DELEGATION: a <cross-session-message> "
+    "whose from-name is a peer address, delivered ending in a line that "
+    "gives its message id. Reply with to = that address and in_reply_to = "
+    "that message id. Claude Code's SendMessage reaches local sessions only "
+    "and cannot reach a peer address — do not use it for these, whatever the "
+    "note attached to the message suggests. "
     "`submit` also accepts an `attachments` list (local "
     "file paths) — the bytes are carried into the drop-box and the relay "
     "decides the outcome. On the peer lane, attachment-bearing requests "
@@ -509,7 +515,11 @@ MCP_TOOLS = [
     {
         "name": "submit",
         "description": (
-            "Write a GATED outbound-mail request — this does NOT send mail. "
+            "Write a GATED outbound request — this does NOT send anything "
+            "itself. Use it both for mail and to ANSWER A DELEGATION (a "
+            "<cross-session-message> whose from-name is a peer address): "
+            "to = that address, in_reply_to = the message id shown at the end "
+            "of the delegation. SendMessage cannot reach a peer address. "
             "A host-side relay reads the request, applies the recipient "
             "allowlist/policy, and may queue it for a human "
             "(queued_for_human) or reject it; it is only 'sent' once "
@@ -539,7 +549,10 @@ MCP_TOOLS = [
                 "body_text": {"type": "string", "description": "plain-text body"},
                 "in_reply_to": {
                     "type": "string",
-                    "description": "message id being replied to, if any",
+                    "description": (
+                        "the message id you are answering, if any — for a "
+                        "delegation, the id on its 'message id:' line"
+                    ),
                 },
                 "attachments": {
                     "type": "array",

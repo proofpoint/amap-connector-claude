@@ -36,7 +36,7 @@ python3 -m unittest discover -s tests -q
 An isolated checkout reports:
 
 ```
-Ran 123 tests ... OK (skipped=8)
+Ran 129 tests ... OK (skipped=8)
 ```
 
 **Those eight skips are not incidental.** Seven are schema-conformance proofs
