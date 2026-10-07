@@ -54,7 +54,7 @@ python3 -m unittest discover -s tests -q
 
 Stdlib only — there is **no pytest dependency**. The suite is `unittest.TestCase`
 throughout (pytest can collect it if you have it, but nothing here needs it, and
-a bare checkout has no pytest). Verified at HEAD: **133 tests, `OK (skipped=8)`,
+a bare checkout has no pytest). Verified at HEAD: **143 tests, `OK (skipped=8)`,
 ~40 s** in a checkout with no sibling `amap-spec` (the eight skips are the schema
 proofs plus their gate — see below; do not set `AMAP_REQUIRE_SPEC` unless a spec
 checkout is present, or those skips become a failure). The suite is slow for its
@@ -249,6 +249,14 @@ only names matching `^peer-[a-f0-9]{32}\.json$`. Never `os.link` (the router
 requires `nlink == 1`). **The router unlinks each file after reading it:** never
 assume a previous outcome is still there, never read outcomes back, and on a
 later transition write the same name again.
+
+**Notice ids are whatever the spec allows, on both lanes** —
+`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`, capped at 200, the reader's own rule. The
+daemon once accepted exactly 32 lowercase hex, the shape `amap-router-local`
+mints, and silently skipped every other conformant id: an IMAP runtime's
+`<uidvalidity>-<uid>` mail was readable but never announced. Do not narrow it
+back to match the router's outcome-file pattern above: that pattern describes
+what one router mints and reads, and a runtime minting other ids reads its own.
 
 ### Config fails loud, never guesses
 

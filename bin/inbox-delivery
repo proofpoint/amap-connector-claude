@@ -187,8 +187,14 @@ MAX_BODY_BYTES = 256 * 1024         # a body larger than this is refused, not tr
 # notices from becoming a burst of silent losses; the rest wait one poll.
 MAX_IN_FLIGHT = 8
 
-NOTICE_ID_RE = re.compile(r"^[a-f0-9]{32}$")
-NOTICE_FILE_RE = re.compile(r"^notice-([a-f0-9]{32})\.json$")
+# A notice id is whatever the spec allows, on BOTH lanes:
+# ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ (deliver-notice and peer-notice alike), capped at
+# 200 so it stays safe inside a filename -- the same rule inbox-mcp-vol's reader
+# applies. This used to be exactly 32 lowercase hex, the shape one runtime
+# happens to mint. Every other conformant id -- the spec's own fixtures,
+# "<uidvalidity>-<uid>" from an IMAP runtime -- was skipped without a log line,
+# so that runtime's mail was readable but never announced.
+NOTICE_FILE_RE = re.compile(r"^notice-([A-Za-z0-9_][A-Za-z0-9_.-]{0,199})\.json$")
 # A bare addr-spec, the shape peers.json's `self` and notice.from carry.
 # Deliberately strict: it is compared for equality, never parsed further.
 ADDR_SPEC_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$")
@@ -609,7 +615,7 @@ def _held_detail(reason: str) -> str:
     return ("held by the receiving sandbox." + said +
             " The wire carries no hold cause: a permission-mode hold is"
             " human-approvable and is DROPPED if nobody answers within the"
-            " receiver's dialogExpiry (5 minutes by default); a"
+            " receiver's dialogExpiry; a"
             " crossSessionInbound `hold` setting does not expire and is"
             " released only when `accept` applies. Check that sandbox.")
 

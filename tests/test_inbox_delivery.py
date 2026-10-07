@@ -800,6 +800,29 @@ class AncestryAndLoadTest(DeliveryTestCase):
                         "the rest must still be delivered on later polls")
 
 
+class NoticeIdShapeTest(DeliveryTestCase):
+    """The daemon accepts any id the spec allows, on both lanes. It once
+    accepted only 32 lowercase hex -- the shape one runtime mints -- and skipped
+    every other conformant id without a log line."""
+
+    IMAP_ID = "1-1"                              # "<uidvalidity>-<uid>"
+    SPEC_ID = "1721457600000000000-4242"         # the spec's own fixture shape
+
+    def test_a_mail_notice_with_an_imap_style_id_rings_the_doorbell(self):
+        lab = self.lab()
+        lab.mail_notice(notice_id=self.IMAP_ID)
+        lab.start()
+        self.assertTrue(lab.wait_for(lambda: lab.ledgered(self.IMAP_ID, "mail")), lab.stderr())
+        self.assertIn("you have mail", lab.receiver.frames[0][1]["message"]["content"])
+
+    def test_a_peer_notice_with_the_specs_fixture_id_is_delivered(self):
+        lab = self.lab()
+        lab.peer_notice(notice_id=self.SPEC_ID)
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered", notice_id=self.SPEC_ID), lab.stderr())
+        self.assertTrue(lab.ledgered(self.SPEC_ID))
+
+
 class MailLaneTest(DeliveryTestCase):
     def test_doorbell_is_content_free_and_writes_no_outcome(self):
         lab = self.lab()
