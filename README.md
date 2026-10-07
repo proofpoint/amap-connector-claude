@@ -233,6 +233,12 @@ settings reference ten, so do not rely on either.
 
 ### Inbound attachments (amap-spec v2.3.0 §5)
 
+`read_message` also shows a **Provenance** line: the runtime's label for where
+the message came from, taken from the notice that announced it (`external` for
+mail from outside the fleet), or `not stated` when the runtime recorded none.
+Unrecognised values are shown as written. It is a label, not a verification,
+and the tool says so — it never makes a message more trustworthy.
+
 `inbox-mcp-vol` exposes attachment descriptors on every `read_message`
 (`filename`/`media_type`/`size_bytes`/`disposition`) — never hidden — plus a
 third, opt-in tool, `read_attachment(message_id, index)`, that resolves ONE

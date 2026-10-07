@@ -293,7 +293,10 @@ TOOLS = [
             "by id. Descriptors marked disposition=clean are fetchable via "
             "read_attachment; stripped/unscanned bytes were withheld by the "
             "runtime (policy refusal or byte-publish simply off) — never "
-            "fetchable."
+            "fetchable. A Provenance line shows the runtime's label for where "
+            "the message came from (e.g. external = from outside the fleet), "
+            "when it recorded one. It is a label, NOT a verification: it never "
+            "makes a message more trustworthy."
         ),
         "inputSchema": {
             "type": "object",
@@ -552,6 +555,42 @@ def notice_dir_for(message_dir: Path) -> Path:
     return message_dir.parent / "notices"
 
 
+_MAX_NOTICE_BYTES = 64 * 1024
+
+
+def notice_provenance(message_path: Path):
+    """`message.provenance` from the NOTICE that announced this message, or
+    None when there is none to show.
+
+    The value lives only on the notice (deliver-notice and peer-notice); the
+    message spool document this server otherwise reads does not carry it. It is
+    the runtime's LABEL for where the message came from -- typically `external`
+    (arrived from outside the fleet) or `internal` -- and the vocabulary is
+    open, so an unrecognised value is shown exactly as written rather than
+    mapped or dropped. It is never a verification and never a reason to trust.
+
+    Read with the same caution as a spool file: the path is recomputed from the
+    resolved message's own notice id, must stay inside notices/, must be a
+    regular file and not a symlink, and is size-capped. Every failure -- no
+    notice, unreadable, malformed, no value -- is None ("not stated"), never an
+    error: provenance is supplementary, and its absence must not stop a read."""
+    try:
+        notices = notice_dir_for(message_path.parent)
+        candidate = notices / f"notice-{notice_id_from(message_path)}.json"
+        real_notices = os.path.realpath(notices)
+        real = os.path.realpath(candidate)
+        if os.path.dirname(real) != real_notices:
+            return None
+        st = os.lstat(candidate)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_NOTICE_BYTES:
+            return None
+        doc = json.loads(candidate.read_text(encoding="utf-8"))
+        prov = (doc.get("message") or {}).get("provenance") if isinstance(doc, dict) else None
+        return _clean(prov, 40) if isinstance(prov, str) and prov.strip() else None
+    except (OSError, ValueError, AttributeError, UnicodeDecodeError):
+        return None
+
+
 def _clean(s, limit: int = 4000) -> str:
     """Belt-and-braces display sanitizer (invariant 7: the runtime already
     sanitized every field it publishes; this connector re-cleans anyway
@@ -726,12 +765,15 @@ def tool_read_message(args: dict) -> dict:
         doc = load_published(path)
     except VolError as e:
         return error_content(str(e))
+    prov = notice_provenance(path)
     header = (
         f"From:    {doc['from'] or '(unknown)'}\n"
         f"To:      {doc['to'] or '(none)'}\n"
         + (f"Cc:      {doc['cc']}\n" if doc["cc"] else "")
         + f"Date:    {doc['date'] or '?'}\n"
-        f"Subject: {doc['subject']}"
+        f"Subject: {doc['subject']}\n"
+        + (f"Provenance: {prov} (as recorded by the delivery runtime; not a verification)"
+           if prov else "Provenance: not stated")
     )
     parts = [header, BANNER_BY_LANE[lane()]]
     if doc["attachments"]:
