@@ -54,8 +54,8 @@ python3 -m unittest discover -s tests -q
 
 Stdlib only — there is **no pytest dependency**. The suite is `unittest.TestCase`
 throughout (pytest can collect it if you have it, but nothing here needs it, and
-a bare checkout has no pytest). Verified at HEAD: **143 tests, `OK (skipped=8)`,
-~40 s** in a checkout with no sibling `amap-spec` (the eight skips are the schema
+a bare checkout has no pytest). Verified at HEAD: **161 tests, `OK (skipped=8)`,
+~70 s** in a checkout with no sibling `amap-spec` (the eight skips are the schema
 proofs plus their gate — see below; do not set `AMAP_REQUIRE_SPEC` unless a spec
 checkout is present, or those skips become a failure). The suite is slow for its
 size on purpose — `test_inbox_delivery.py` starts `bin/inbox-delivery` as a real
@@ -220,6 +220,23 @@ deployment by starting the daemon from a session hook: the guard would refuse
 it, and correctly. And never send `CLAUDE_CODE_MESSAGING_TOKEN`; that token is
 how a child proves it is the session's own.
 
+### Never a parked session
+
+A session whose conversation was moved into a background job is **parked**: it
+stays alive, accepts frames, queues them and never reads them, and it sends no
+receipt. Measured 2026-10-08: 42+ delegations were recorded `delivered` into
+one. Silence means delivery only when the target is the session taking turns.
+
+Choosing that session is the session source's job, and the host adapter's
+lister does it. The daemon's backstop is `session_parked()`: it reads Claude
+Code's `<session_pid>.json` beside the row's key file and refuses a target
+whose `parkedJobId` is set (`inject_failed` on the peer lane, retried; the
+doorbell waits). That field is **undocumented**, so the check **fails open**,
+logged once: a missing, unreadable or foreign-pid file means "cannot tell" and
+delivery proceeds. Do not turn it fail-closed; a format change in Claude Code
+would then stop all delivery. A row whose socket or key file is `-` is not a
+target at all.
+
 ### Silence is delivery, and is never retried
 
 Under `accept` the receiver emits no receipt on any channel. So silence within
@@ -286,6 +303,14 @@ definitively-gone holder releases a claim.
 All three MCP servers keep stdout JSON-RPC-pure under **every** error condition,
 including the config fail-loud path. The daemon writes everything to stderr and
 never uses stdout. A stray `print()` is a wire corruption, not a log line.
+
+### A version refusal is its own outcome
+
+`inbox-mcp-vol` reads a message document's `contract_version` before anything
+else and refuses an **absent, lower, higher or non-numeric** major (draft
+§12.1), with an error that says "version refusal" and a stderr line. It once
+refused only a higher major. Keep the wording distinct from the malformed-
+document errors: §12.1 forbids folding one into the other.
 
 ### Never dereference a grant you were not asked to
 

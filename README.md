@@ -204,7 +204,19 @@ behave; the daemon cannot enforce most of them, so a deployment has to.
   finds nothing in that case, and delivery stops without an error. Claude Code
   exports the path as `CLAUDE_CODE_MESSAGING_SOCKET` only to its child
   processes, not into its own environment, so a lister inspecting the session
-  from outside cannot read it there.
+  from outside cannot read it there. A row whose socket or key file is `-`
+  names no session, and the daemon waits. Whatever the lister writes to stderr
+  is logged, once per change.
+- **The session that takes turns, not a parked one.** When a conversation is
+  moved into a background job, the session it left stays alive, still accepts
+  messages and queues them, and never reads them. It sends no receipt, so
+  silence there looks exactly like delivery: in one fleet, 42 delegations were
+  recorded `delivered` into a parked session before anyone noticed. The lister
+  must name the job's session instead. As a backstop, the daemon reads Claude
+  Code's session file (`<session_pid>.json`, beside the key file) and refuses a
+  session whose `parkedJobId` is set, with `inject_failed`, retrying until the
+  row changes. That field is undocumented, so the check fails open: a missing
+  or unexpected file is logged and delivery goes ahead.
 - **A writable socket directory.** The daemon binds its receipt socket beside the
   session's socket. If it cannot, or the session does not recognise the
   directory, no receipt ever arrives — and silence within the window is recorded

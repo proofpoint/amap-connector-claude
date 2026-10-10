@@ -370,6 +370,13 @@ class VolError(Exception):
     """Any spool-read failure (bad id, missing file, unparsable .eml)."""
 
 
+class VersionRefusal(VolError):
+    """A message whose contract_version major is absent, lower or higher than
+    the one this connector speaks. Draft §12.1 makes this a DISTINCT, LOGGED
+    outcome, never folded into the malformed-document path, so it has its own
+    class, its own wording, and a stderr line."""
+
+
 # --- spool dir + path-traversal-proof id handling ---------------------------
 
 def expand_path(value: str) -> str:
@@ -615,6 +622,34 @@ def _clean_body(s, limit: int = 1_000_000) -> str:
     return s[:limit]
 
 
+def check_version(doc: dict, name: str) -> None:
+    """Draft §12.1, the fail-closed rule: read contract_version FIRST and
+    compare majors as non-negative decimal integers. "An absent major, a lower
+    major, or a higher major is a version refusal: fail closed, as a distinct,
+    logged outcome." This once refused only a HIGHER major and let an absent
+    or lower one through to be parsed as if it were current.
+
+    The inbound-message artifact is itself optional (§7.3), but when it is
+    present contract_version is required (§12.2). A legacy pre-v2.1.0 spool
+    file without one is therefore refused too: reading it would be guessing
+    at a shape no version names."""
+    cv = doc.get("contract_version")
+    major = cv.split(".")[0] if isinstance(cv, str) else ""
+    if major.isdigit() and int(major) == int(CONTRACT_VERSION):
+        return
+    if cv is None:
+        why = "has no contract_version"
+    elif major.isdigit():
+        rel = "newer" if int(major) > int(CONTRACT_VERSION) else "older"
+        why = f"has contract_version {_clean(cv, 20)!r}, an {rel} major"
+    else:
+        why = f"has contract_version {_clean(str(cv), 20)!r}, which is not a major version"
+    msg = (f"version refusal: message {_clean(name, 220)} {why}; this connector "
+           f"speaks major {CONTRACT_VERSION!r} and will not guess at another shape")
+    log(msg)
+    raise VersionRefusal(msg)
+
+
 def load_published(path: Path) -> dict:
     """Read + json.loads one `<id>.json` published-message file, with a size
     guard and defensive field coercion. Raises VolError on any parse/type
@@ -654,18 +689,7 @@ def load_published(path: Path) -> dict:
     if not isinstance(doc, dict):
         raise VolError("read_message: malformed published message: not a JSON object")
 
-    # v2.1.0 (spec/contract.md §7): fail closed on a newer major than this
-    # connector speaks, same rule qm's `check_version` applies. Absent
-    # (pre-v2.1.0 spool) or matching major is fine; `notice_id`/
-    # `contract_version` themselves are otherwise just dropped by the
-    # field-picking return below — they were never load-bearing here.
-    cv = doc.get("contract_version")
-    if isinstance(cv, str) and cv:
-        major = cv.split(".")[0]
-        if major.isdigit() and int(major) > int(CONTRACT_VERSION):
-            raise VolError(
-                f"read_message: contract_version {cv!r} is a newer major than "
-                f"this connector speaks ({CONTRACT_VERSION!r}) — refusing")
+    check_version(doc, path.name)
 
     attachments = doc.get("attachments")
     if not isinstance(attachments, list) or not all(isinstance(a, dict) for a in attachments):
