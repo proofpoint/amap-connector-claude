@@ -785,7 +785,7 @@ class AncestryAndLoadTest(DeliveryTestCase):
         self.assertIn("cannot check", lab.stderr())
 
     def test_injections_in_flight_are_capped(self):
-        """The receiver queues at most 50 and drops past that, silently from here.
+        """The receiver queues at most 50 and reports a drop past that (measured).
         The daemon keeps its own concurrency at 8 (MAX_IN_FLIGHT)."""
         lab = self.lab()
         ids = [f"{i:032x}" for i in range(1, 13)]
@@ -798,6 +798,134 @@ class AncestryAndLoadTest(DeliveryTestCase):
                              "more than MAX_IN_FLIGHT injections were open at once")
         self.assertTrue(lab.wait_for(lambda: all(lab.ledgered(n) for n in ids), timeout=30),
                         "the rest must still be delivered on later polls")
+
+
+class ParkedSessionTest(DeliveryTestCase):
+    """A PARKED session (its conversation moved to a background job) accepts a
+    frame, queues it unread and sends no receipt, so silence there looks like
+    delivery. Measured 2026-10-08: 42+ delegations were recorded `delivered`
+    into one. The evidence is Claude Code's <pid>.json beside the row's key
+    file; its `parkedJobId` is undocumented, so the check fails OPEN."""
+
+    PID = 4242
+
+    def session_file(self, lab, **fields):
+        doc = {"pid": self.PID, "sessionId": "s", "status": "idle", **fields}
+        (lab.sockdir / f"{self.PID}.json").write_text(json.dumps(doc))
+
+    def test_a_parked_session_is_refused_and_retried_until_it_is_not(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, agent_pid=self.PID)
+        self.session_file(lab, parkedJobId="0a1b2c3d")
+        lab.start()
+        self.assertTrue(lab.wait_outcome("inject_failed"), lab.stderr())
+        self.assertIn("parked", lab.outcome()["detail"])
+        self.assertIn("0a1b2c3d", lab.outcome()["detail"])
+        time.sleep(1.0)
+        self.assertEqual(lab.receiver.connections, 0, "nothing may be sent to a parked session")
+        self.assertFalse(lab.ledgered())
+        self.session_file(lab)                       # the session resumed
+        self.assertTrue(lab.wait_outcome("delivered", timeout=15), lab.stderr())
+
+    def test_a_parked_session_gets_no_doorbell(self):
+        lab = self.lab()
+        lab.mail_notice()
+        lab.set_claude_rows(1, agent_pid=self.PID)
+        self.session_file(lab, parkedJobId="0a1b2c3d")
+        lab.start()
+        self.assertTrue(lab.wait_for(lambda: "is parked" in lab.stderr()), lab.stderr())
+        time.sleep(1.0)
+        self.assertEqual(lab.receiver.connections, 0)
+        self.assertFalse(lab.ledgered(NOTICE_ID, "mail"))
+
+    def test_a_live_session_file_delivers_without_comment(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, agent_pid=self.PID)
+        self.session_file(lab, status="busy")
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+        self.assertNotIn("parked", lab.stderr())
+
+    def test_no_session_file_fails_open_and_says_so(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, agent_pid=self.PID)
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+        self.assertIn("cannot check whether the target session is parked", lab.stderr())
+
+    def test_a_session_file_for_another_pid_is_not_believed(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, agent_pid=self.PID)
+        (lab.sockdir / f"{self.PID}.json").write_text(
+            json.dumps({"pid": self.PID + 1, "parkedJobId": "0a1b2c3d"}))
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+        self.assertIn("does not name pid", lab.stderr())
+
+
+class SessionSourceRowTest(DeliveryTestCase):
+    """What the session source says beyond its rows."""
+
+    def test_a_claude_row_with_no_socket_means_wait(self):
+        """The helper writes "-" for a pane whose claude has not started or whose
+        parked session's successor it could not resolve. Never an inject on "-"."""
+        lab = self.lab()
+        lab.peer_notice()
+        lab.rows.write_text("\t".join(["claude", "0", "100", "-", "-", "-"]) + "\n")
+        lab.start()
+        time.sleep(2.0)
+        self.assertIsNone(lab.outcome(), lab.stderr())
+        self.assertEqual(lab.receiver.connections, 0)
+        self.assertFalse(lab.ledgered())
+        lab.set_claude_rows(1)                     # the session appears
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+
+    def test_the_helpers_stderr_is_logged_once_per_change(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.session_source.write_text(
+            "#!/bin/sh\necho 'pane 0: parked session 4242 followed to job 0a1b2c3d' >&2\n"
+            "cat \"$LAB_ROWS\"\n")
+        # No session yet, so the helper runs on every poll while it waits.
+        lab.rows.write_text("\t".join(["claude", "0", "100", "-", "-", "-"]) + "\n")
+        lab.start()
+        self.assertTrue(lab.wait_for(lambda: "session source: pane 0" in lab.stderr()), lab.stderr())
+        time.sleep(2.0)                            # about four more polls
+        self.assertEqual(lab.stderr().count("session source: pane 0: parked session 4242"), 1,
+                         lab.stderr())
+
+
+class OutcomeLoggingTest(DeliveryTestCase):
+    """The outcome file is the router's and is unlinked once read, so the
+    daemon's own log must say what happened, and to which session."""
+
+    def test_a_peer_delivery_is_logged_with_its_target_pid(self):
+        lab = self.lab()
+        lab.peer_notice()
+        lab.set_claude_rows(1, agent_pid=4343)
+        lab.start()
+        self.assertTrue(lab.wait_outcome("delivered"), lab.stderr())
+        self.assertTrue(lab.wait_for(
+            lambda: f"peer notice {NOTICE_ID}: delivered (target pid 4343)" in lab.stderr()),
+            lab.stderr())
+
+    def test_a_peer_inject_failure_is_logged(self):
+        lab = self.lab(script=("dropped",))
+        lab.peer_notice()
+        lab.start()
+        self.assertTrue(lab.wait_outcome("inject_failed"), lab.stderr())
+        self.assertIn(f"peer notice {NOTICE_ID}: inject_failed (target pid", lab.stderr())
+
+    def test_a_doorbell_is_logged_with_its_target_pid(self):
+        lab = self.lab()
+        lab.mail_notice()
+        lab.set_claude_rows(1, agent_pid=4343)
+        lab.start()
+        self.assertTrue(lab.wait_for(lambda: "rung (target pid 4343" in lab.stderr()), lab.stderr())
 
 
 class NoticeIdShapeTest(DeliveryTestCase):

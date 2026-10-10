@@ -54,7 +54,9 @@ Targeting — refuse, don't guess: run AMAP_DELIVERY_SESSION_SOURCE and count th
 rows whose agent is "claude". Exactly one -> inject via its socket and key
 file. Several -> outcome "ambiguous_target", the notice stays in the spool.
 None -> wait and re-poll. "No panes ever" is not special-cased: not running
-this daemon where no session can exist is the host's job.
+this daemon where no session can exist is the host's job. One row that names
+a PARKED session (its conversation moved to a background job) is refused too:
+see session_parked().
 
 The envelope — this daemon OWNS it. Claude Code parses the sender's identity
 and class claim out of the CONTENT STRING with an anchored regex, measured
@@ -125,6 +127,7 @@ import os
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -182,10 +185,14 @@ HELD_WAIT_SECONDS = 3600.0          # how long a worker waits on a held receipt
 BACKOFF_FIRST, BACKOFF_MAX = 2.0, 300.0
 MAX_BODY_BYTES = 256 * 1024         # a body larger than this is refused, not truncated
 # Injections in flight at once. The receiving session queues at most 50 accepted
-# messages and drops past that, and a drop there is silent here -- which this
-# daemon would record as `delivered`. Staying well under it keeps a burst of
-# notices from becoming a burst of silent losses; the rest wait one poll.
+# messages and drops past that. The drop is REPORTED: a live receiver measured
+# on 2.1.278 answered sixty sends with exactly ten `dropped` receipts, which
+# this daemon retries with backoff. Staying well under the cap keeps a burst of
+# notices from becoming a burst of retries; the rest wait one poll.
 MAX_IN_FLIGHT = 8
+# The receiver's session file is read only to see whether it is parked, and is
+# small; anything larger is not that file.
+MAX_SESSION_FILE_BYTES = 64 * 1024
 
 # A notice id is whatever the spec allows, on BOTH lanes:
 # ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ (deliver-notice and peer-notice alike), capped at
@@ -460,6 +467,9 @@ class Target:
         self.agent_pid = agent_pid      # the session's own pid, when the row gives one
 
 
+_helper_said = [""]       # the helper's last stderr, so a repeat is not re-logged
+
+
 def find_claude_targets(session_source: str) -> Optional[List[Target]]:
     """Run the helper; one row per live pane:
     `agent pane_index pane_pid agent_pid socket keyfile`. Returns the claude
@@ -472,10 +482,23 @@ def find_claude_targets(session_source: str) -> Optional[List[Target]]:
     if p.returncode != 0:
         log(f"session source exited {p.returncode}: {p.stderr.strip()[:200]}")
         return None
+    # The helper explains its choices on stderr (a parked session followed to
+    # its job, a successor it could not resolve). Pass that on, once per
+    # change: it runs every poll, and the same line each half second is noise.
+    said = p.stderr.strip()[:500]
+    if said and said != _helper_said[0]:
+        for line in said.splitlines():
+            log(f"session source: {line}")
+    _helper_said[0] = said
     targets = []
     for line in p.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 6 and parts[0] == "claude":
+            if parts[4] == "-" or parts[5] == "-":
+                # A pane whose claude has not started, or whose session the
+                # helper could not resolve: no session to deliver to. Not a
+                # target, so zero rows means wait, never an attempt on "-".
+                continue
             # Fields 1-2 (pane index, pane pid) are never read, so a host with
             # no panes may write "-" there. Field 3 is the session's pid, read
             # for the ancestry guard only.
@@ -501,6 +524,50 @@ def ancestor_pids() -> Optional[frozenset]:
         if not out:
             return None
     return frozenset(out)
+
+
+def session_parked(target: "Target") -> Tuple[Optional[str], Optional[str]]:
+    """Whether the target session is PARKED: its conversation has moved to a
+    background job and it no longer takes turns. Returns (job_id, None) when
+    parked, (None, None) when not, and (None, why) when it cannot tell.
+
+    A parked session still accepts a frame, queues it, and sends no receipt,
+    so silence there looks exactly like delivery to a live one. Measured
+    2026-10-08: a pane session parked into a background job queued 42+
+    delegations that no conversation ever read, each recorded `delivered`.
+    Silence means delivery only when the target is the session taking turns.
+
+    The evidence is Claude Code's own session file, <pid>.json, beside the
+    key file the row names. Its `parkedJobId` field is UNDOCUMENTED, so this
+    check fails OPEN: anything unexpected is "cannot tell" and the caller
+    delivers as before, with a log line. It is a backstop; the session source
+    is what should name the live session."""
+    pid = target.agent_pid
+    if pid is None:
+        return None, "the session source gave no numeric session pid"
+    path = os.path.join(os.path.dirname(target.key_file), f"{pid}.json")
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            return None, f"{path} is not a regular file"
+        if st.st_size > MAX_SESSION_FILE_BYTES:
+            return None, f"{path} is larger than a session file"
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return None, f"no session file at {path}"
+    except (OSError, ValueError) as e:
+        return None, f"cannot read {path}: {e.__class__.__name__}"
+    if not isinstance(doc, dict):
+        return None, f"{path} is not a JSON object"
+    if doc.get("pid") != pid:
+        return None, f"{path} does not name pid {pid}"
+    job = doc.get("parkedJobId")
+    if job is None or job == "":
+        return None, None
+    if not isinstance(job, str):
+        return None, f"{path} has a parkedJobId that is not a string"
+    return sanitize_attr(job, 64), None
 
 
 # --- the wire ----------------------------------------------------------------------
@@ -781,8 +848,7 @@ class Daemon:
             if ("unverifiable", why) not in self._ancestry_logged:
                 self._ancestry_logged.add(("unverifiable", why))
                 log(f"cannot check that the target session is not this daemon's ancestor: {why}")
-            return target
-        if pid in self.ancestors:
+        elif pid in self.ancestors:
             detail = (f"target session pid {pid} is an ancestor of this daemon; a message "
                       "from it would count as the session's own output, not a peer's. "
                       "Start inbox-delivery outside the session's process tree.")
@@ -790,19 +856,47 @@ class Daemon:
                 self._ancestry_logged.add(pid)
                 log(detail)
             if tree == TREE_PEER:
-                self._outcome_once(tree, notice_id, "inject_failed", detail)
+                self._outcome_once(tree, notice_id, "inject_failed", detail, target=target)
+            return None
+        # NEVER DELIVER TO A PARKED SESSION. It queues the frame unread and
+        # sends no receipt, so the silence below would be recorded as delivery.
+        # Refuse and retry: once the session source names the live session, or
+        # the parked one resumes, the notice goes through. See session_parked().
+        job, why = session_parked(target)
+        if why is not None:
+            if ("park-unknown", why) not in self._ancestry_logged:
+                self._ancestry_logged.add(("park-unknown", why))
+                log(f"cannot check whether the target session is parked: {why}")
+        elif job is not None:
+            detail = (f"target session pid {pid} is parked: its conversation continues in "
+                      f"background job {job}, and a parked session queues a message without "
+                      "reading it. The session source should name the job's session instead.")
+            if ("parked", pid, job) not in self._ancestry_logged:
+                self._ancestry_logged.add(("parked", pid, job))
+                log(detail)
+            if tree == TREE_PEER:
+                self._outcome_once(tree, notice_id, "inject_failed", detail, target=target)
+                self._schedule_retry((tree, notice_id))
             return None
         return target
 
-    def _outcome_once(self, tree: str, notice_id: str, outcome: str, detail: str = "") -> None:
+    def _outcome_once(self, tree: str, notice_id: str, outcome: str, detail: str = "",
+                      *, target: Optional[Target] = None) -> None:
         """Write an outcome when it is a TRANSITION for this notice. The router
         dedups per (tree, id, outcome) and unlinks, so rewriting the same state
-        every poll would only churn; a later different state is always written."""
+        every poll would only churn; a later different state is always written.
+
+        Every transition is also LOGGED, with the target session's pid when
+        there is one. The outcome file is the router's and is unlinked once
+        read, so without this line the daemon's own log showed nothing at all
+        while it delivered 42+ notices into a parked session."""
         key = (tree, notice_id)
         with self.lock:
             if self.last_outcome.get(key) == outcome:
                 return
             self.last_outcome[key] = outcome
+        where = f" (target pid {target.agent_pid})" if target is not None and target.agent_pid else ""
+        log(f"{tree} notice {notice_id}: {outcome}{where}" + (f" — {detail}" if detail else ""))
         self.outcomes.write(tree, notice_id, outcome, detail or None)
 
     # -- mail lane ------------------------------------------------------------
@@ -933,8 +1027,7 @@ class Daemon:
         return frm, body + "\n" + reply_trailer(frm, msg.get("id"))
 
     def _refuse(self, notice_id: str, why: str) -> None:
-        log(f"peer notice {notice_id}: refused — {why}")
-        # Refused is terminal for this notice: record it so it is not re-judged
+        # _outcome_once logs it. Refused is terminal for this notice: record it so it is not re-judged
         # every poll, then tell the sender through the outcome path.
         self.ledger.record(TREE_PEER, notice_id)
         self._outcome_once(TREE_PEER, notice_id, "refused", why)
@@ -975,11 +1068,12 @@ class Daemon:
                         f"will re-offer in {int(HELD_WAIT_SECONDS)}s")
                     return
                 self.ledger.record(TREE_MAIL, notice_id)
+                log(f"mail doorbell {notice_id}: rung (target pid {target.agent_pid}, {r.status})")
                 return
 
             def on_status(status: str, reason: str = "") -> None:
                 if status == "held":
-                    self._outcome_once(tree, notice_id, "held", _held_detail(reason))
+                    self._outcome_once(tree, notice_id, "held", _held_detail(reason), target=target)
 
             r = inject(target, content, msg_id, on_status, self.stop, first_timeout=self.window)
             if r.status == "silent":
@@ -989,20 +1083,21 @@ class Daemon:
                 self.ledger.record(tree, notice_id)          # BEFORE the outcome
                 self._outcome_once(tree, notice_id, "delivered",
                                    f"inferred: receiver accepted the frame and issued no negative "
-                                   f"receipt within {self.window:g}s (accept emits none)")
+                                   f"receipt within {self.window:g}s (accept emits none)", target=target)
             elif r.status == "delivered":
                 self.ledger.record(tree, notice_id)          # BEFORE the outcome
-                self._outcome_once(tree, notice_id, "delivered", "receipt: delivered")
+                self._outcome_once(tree, notice_id, "delivered", "receipt: delivered", target=target)
             elif r.status == "denied":
                 self.ledger.record(tree, notice_id)          # a human said no; final
-                self._outcome_once(tree, notice_id, "denied", r.detail)
+                self._outcome_once(tree, notice_id, "denied", r.detail, target=target)
             elif r.status == "receiver_refused":
                 # A configuration hold, not a human decision and not this daemon's
                 # gate: the receiving sandbox has crossSessionInbound off or set to
                 # refuse. Alert the operator through `held`; re-offer much later.
                 self._outcome_once(tree, notice_id, "held",
                                    "receiver refuses cross-session messages — crossSessionInbound is "
-                                   "not `accept` in this sandbox; fix the setting and the daemon re-offers")
+                                   "not `accept` in this sandbox; fix the setting and the daemon re-offers",
+                                   target=target)
                 self.retry_at[key] = time.monotonic() + HELD_WAIT_SECONDS
             elif r.status == "held":
                 # Waited out; still held. Leave it: re-sending would park a
@@ -1010,7 +1105,8 @@ class Daemon:
                 self.retry_at[key] = time.monotonic() + HELD_WAIT_SECONDS
             else:
                 # error / dropped / expired: nothing was delivered; retry with backoff.
-                self._outcome_once(tree, notice_id, "inject_failed", f"{r.status}: {r.detail}"[:200])
+                self._outcome_once(tree, notice_id, "inject_failed", f"{r.status}: {r.detail}"[:200],
+                                   target=target)
                 self._schedule_retry(key)
         finally:
             self.in_flight.discard(key)
